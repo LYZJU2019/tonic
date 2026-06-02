@@ -345,16 +345,15 @@ where
         let Some(picked) = self.picker.pick(&req, &self.ready) else {
             return LbFuture::Error(Some(LbError::Unavailable));
         };
-        // Cheap clones (all Arc-shared internals) so the async block
+        // Cheap clone (all Arc-shared internals) so the async block
         // can take ownership without holding the picker borrow.
         let mut svc = picked.clone();
-        let recorder = picked.clone();
         LbFuture::Pending(Box::pin(async move {
             tower::ServiceExt::ready(&mut svc)
                 .await
                 .map_err(|e| LbError::LbChannelPollReadyError(e.into()))?;
             let result = svc.call(req).await;
-            recorder.record_outcome(result.is_ok());
+            svc.record_outcome(result.is_ok());
             result.map_err(|e| LbError::LbChannelCallError(e.into()))
         }))
     }
