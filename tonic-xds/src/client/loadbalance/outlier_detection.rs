@@ -282,6 +282,14 @@ pub(crate) fn spawn_actor(registry: Arc<OutlierStatsRegistry>) -> AbortOnDrop {
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` fires its first tick immediately; consume it so the
+        // first `run_housekeeping` happens one full period after spawn,
+        // not at t=0. Without this, counters that the data path is
+        // accumulating between `OutlierDetector::new` and the first
+        // recorded outcome can be snapshot_and_reset to zero, causing
+        // flakiness in tests and dropping the first interval's worth of
+        // outcomes in production.
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             registry.run_housekeeping();
