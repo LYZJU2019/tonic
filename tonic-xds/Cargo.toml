@@ -110,6 +110,9 @@ allowed_external_types = [
     "http::*",
     "http_body::*",
 
+    # Public `CertificateData` surfaces CA roots as a rustls `RootCertStore`.
+    "rustls::*",
+
     # not major released
     "prost::*",
     "opentelemetry::*",
