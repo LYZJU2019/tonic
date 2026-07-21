@@ -14,26 +14,52 @@ pub(crate) mod verifier;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustls::RootCertStore;
 use serde::Deserialize;
 
 use crate::xds::bootstrap::CertProviderPluginConfig;
 
 /// PEM-encoded identity (a cert chain paired with its private key).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Identity {
+    cert_chain: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl Identity {
+    /// Creates an identity from a PEM certificate chain and PEM private key.
+    pub fn new(cert_chain: Vec<u8>, key: Vec<u8>) -> Self {
+        Self { cert_chain, key }
+    }
+
     /// PEM-encoded certificate chain.
-    pub cert_chain: Vec<u8>,
+    pub fn cert_chain(&self) -> &[u8] {
+        &self.cert_chain
+    }
+
     /// PEM-encoded private key.
-    pub key: Vec<u8>,
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+}
+
+// Manual `Debug` keeps the private key out of logs.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field(
+                "cert_chain",
+                &format_args!("{} bytes", self.cert_chain.len()),
+            )
+            .field("key", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 /// Certificate material returned by a [`CertificateProvider`] plugin.
 ///
-/// CA roots are pre-parsed into an [`Arc<RootCertStore>`] so consumers reach
-/// for it on every TLS handshake without paying parse cost. Identity material
-/// stays as PEM bytes since [`tonic::transport::Identity::from_pem`] is
-/// itself bytes-only.
+/// Both the CA trust bundle and the identity are carried as PEM bytes; the
+/// consumer parses them (e.g. into a rustls `RootCertStore`) at the point of
+/// use.
 ///
 /// The variants encode two invariants from gRFC A29 and A65 at the type level:
 ///
@@ -53,8 +79,8 @@ pub enum CertificateData {
     /// CA trust bundle only — used by TLS clients that don't present an
     /// identity.
     RootsOnly {
-        /// CA trust anchors.
-        roots: Arc<RootCertStore>,
+        /// PEM-encoded CA trust anchors.
+        roots: Vec<u8>,
     },
     /// Identity only — used by TLS servers that don't validate peers
     /// (non-mTLS). Peer validation falls back to system roots at the
@@ -65,18 +91,18 @@ pub enum CertificateData {
     },
     /// Both roots and identity — used for mTLS on either end.
     Both {
-        /// CA trust anchors.
-        roots: Arc<RootCertStore>,
+        /// PEM-encoded CA trust anchors.
+        roots: Vec<u8>,
         /// Local certificate chain and private key.
         identity: Identity,
     },
 }
 
 impl CertificateData {
-    /// Parsed CA trust bundle, if present.
-    pub(crate) fn roots(&self) -> Option<&Arc<RootCertStore>> {
+    /// PEM-encoded CA trust bundle, if present.
+    pub(crate) fn roots(&self) -> Option<&[u8]> {
         match self {
-            Self::RootsOnly { roots } | Self::Both { roots, .. } => Some(roots),
+            Self::RootsOnly { roots } | Self::Both { roots, .. } => Some(roots.as_slice()),
             Self::IdentityOnly { .. } => None,
         }
     }
@@ -92,6 +118,7 @@ impl CertificateData {
 
 /// Errors from certificate provider operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CertProviderError {
     /// A certificate file could not be read.
     #[error("failed to read certificate file '{path}': {source}")]
@@ -169,21 +196,10 @@ impl std::fmt::Debug for CertProviderRegistry {
 }
 
 impl CertProviderRegistry {
-    /// Build a registry from the bootstrap `certificate_providers` map.
-    ///
-    /// Dispatches on `plugin_name` and deserializes the opaque `config`
-    /// into the appropriate plugin-specific type. Unknown plugin names
-    /// are rejected here.
+    /// Builds a registry from the bootstrap `certificate_providers` map,
+    /// dispatching on `plugin_name`, and merges in externally supplied provider
+    /// instances that shadow bootstrap instances of the same name.
     pub(crate) fn from_bootstrap(
-        configs: &HashMap<String, CertProviderPluginConfig>,
-    ) -> Result<Self, CertProviderError> {
-        Self::from_bootstrap_with_providers(configs, HashMap::new())
-    }
-
-    /// Like [`from_bootstrap`](Self::from_bootstrap), but merges in externally
-    /// supplied provider instances that shadow bootstrap instances of the same
-    /// name.
-    pub(crate) fn from_bootstrap_with_providers(
         configs: &HashMap<String, CertProviderPluginConfig>,
         injected: HashMap<String, Arc<dyn CertificateProvider>>,
     ) -> Result<Self, CertProviderError> {
@@ -234,7 +250,7 @@ mod tests {
     #[test]
     fn empty_bootstrap_creates_empty_registry() {
         let configs = HashMap::new();
-        let registry = CertProviderRegistry::from_bootstrap(&configs).unwrap();
+        let registry = CertProviderRegistry::from_bootstrap(&configs, HashMap::new()).unwrap();
         assert!(registry.get("anything").is_none());
     }
 
@@ -250,14 +266,16 @@ mod tests {
             }
         }"#;
         let config = crate::xds::bootstrap::BootstrapConfig::from_json(json).unwrap();
-        let err = CertProviderRegistry::from_bootstrap(&config.certificate_providers);
+        let err =
+            CertProviderRegistry::from_bootstrap(&config.certificate_providers, HashMap::new());
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("unknown_plugin"));
     }
 
     #[test]
     fn get_returns_none_for_missing_instance() {
-        let registry = CertProviderRegistry::from_bootstrap(&HashMap::new()).unwrap();
+        let registry =
+            CertProviderRegistry::from_bootstrap(&HashMap::new(), HashMap::new()).unwrap();
         assert!(registry.get("nonexistent").is_none());
     }
 
@@ -273,13 +291,12 @@ mod tests {
     fn injected_provider_is_resolvable_by_instance_name() {
         let provider: Arc<dyn CertificateProvider> =
             Arc::new(StaticProvider(Arc::new(CertificateData::RootsOnly {
-                roots: Arc::new(RootCertStore::empty()),
+                roots: Vec::new(),
             })));
         let mut injected: HashMap<String, Arc<dyn CertificateProvider>> = HashMap::new();
         injected.insert("dv".to_string(), provider);
 
-        let registry =
-            CertProviderRegistry::from_bootstrap_with_providers(&HashMap::new(), injected).unwrap();
+        let registry = CertProviderRegistry::from_bootstrap(&HashMap::new(), injected).unwrap();
 
         assert!(registry.get("dv").is_some());
         assert!(registry.get("missing").is_none());
@@ -301,10 +318,7 @@ mod tests {
         );
 
         let injected_data = Arc::new(CertificateData::IdentityOnly {
-            identity: Identity {
-                cert_chain: b"injected-cert".to_vec(),
-                key: b"injected-key".to_vec(),
-            },
+            identity: Identity::new(b"injected-cert".to_vec(), b"injected-key".to_vec()),
         });
         let mut injected: HashMap<String, Arc<dyn CertificateProvider>> = HashMap::new();
         injected.insert(
@@ -312,8 +326,7 @@ mod tests {
             Arc::new(StaticProvider(injected_data)),
         );
 
-        let registry =
-            CertProviderRegistry::from_bootstrap_with_providers(&configs, injected).unwrap();
+        let registry = CertProviderRegistry::from_bootstrap(&configs, injected).unwrap();
 
         let data = registry.get("shared").unwrap().fetch().unwrap();
         assert!(

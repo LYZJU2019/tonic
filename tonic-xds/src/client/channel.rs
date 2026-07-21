@@ -274,14 +274,10 @@ impl XdsChannelBuilder {
         }
 
         #[cfg(feature = "_tls-any")]
-        let cert_provider_registry = Arc::new(if self.cert_providers.is_empty() {
-            CertProviderRegistry::from_bootstrap(&bootstrap.certificate_providers)?
-        } else {
-            CertProviderRegistry::from_bootstrap_with_providers(
-                &bootstrap.certificate_providers,
-                self.cert_providers.clone(),
-            )?
-        });
+        let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
+            &bootstrap.certificate_providers,
+            self.cert_providers.clone(),
+        )?);
 
         let node = Node::try_from(bootstrap.node)?;
         let client_config =
@@ -715,8 +711,10 @@ mod tests {
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             Arc::new(XdsClusterDiscovery::new(cache, registry))
         };
         #[cfg(not(feature = "_tls-any"))]
@@ -848,8 +846,10 @@ mod tests {
         #[cfg(feature = "_tls-any")]
         let _channel = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry =
-                Arc::new(CertProviderRegistry::from_bootstrap(&Default::default()).unwrap());
+            let registry = Arc::new(
+                CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
+                    .unwrap(),
+            );
             builder.build_from_cache(cache, registry, xds_client, resource_manager)
         };
         #[cfg(not(feature = "_tls-any"))]
