@@ -176,16 +176,20 @@ pub struct XdsChannelBuilder {
 
 impl Debug for XdsChannelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("XdsChannelBuilder")
-            .field("config", &self.config)
-            .field(
-                "recorder",
-                &self
-                    .recorder
-                    .as_deref()
-                    .map_or("None", |r| std::any::type_name_of_val(r)),
-            )
-            .finish()
+        let mut s = f.debug_struct("XdsChannelBuilder");
+        s.field("config", &self.config).field(
+            "recorder",
+            &self
+                .recorder
+                .as_deref()
+                .map_or("None", |r| std::any::type_name_of_val(r)),
+        );
+        #[cfg(feature = "_tls-any")]
+        s.field(
+            "cert_providers",
+            &self.cert_providers.keys().collect::<Vec<_>>(),
+        );
+        s.finish()
     }
 }
 

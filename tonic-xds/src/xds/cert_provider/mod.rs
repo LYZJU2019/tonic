@@ -161,7 +161,7 @@ pub enum CertProviderError {
     EmptyConfig,
     /// Catch-all for errors raised by out-of-crate provider implementations.
     #[error("certificate provider error: {0}")]
-    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    Other(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 /// A certificate provider plugin.
