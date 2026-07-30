@@ -52,7 +52,7 @@ use crate::client::circuit_breaking::is_local_circuit_breaker_drop;
 ///
 /// These are errors where the request was definitely **not** sent, making it safe to retry.
 /// Walks the full error source chain via [`std::error::Error::source`].
-pub(crate) fn is_retryable_connection_error(err: &(dyn std::error::Error + 'static)) -> bool {
+pub fn is_retryable_connection_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
         if let Some(io_err) = e.downcast_ref::<io::Error>() {
@@ -77,14 +77,14 @@ pub(crate) fn is_retryable_grpc_status_code(
     code != tonic::Code::Ok && retryable_codes.contains(&code)
 }
 
-/// Transport-specific retry decisions. [`RetryPolicy`] owns everything else
+/// Transport-specific retry decisions. The retry engine owns everything else
 /// (attempt cap, backoff, body cloning), so a classifier only decides *whether*
 /// a response is retryable and optionally mutates the request before each retry.
 ///
 /// This is the seam that lets non-gRPC transports (e.g. plain HTTP) reuse the
 /// shared retry engine by supplying their own retryable-status logic without
 /// duplicating any retry state machine.
-pub(crate) trait RetryClassifier: Clone {
+pub trait RetryClassifier: Clone {
     /// Whether the request should be retried, given either the transport response
     /// or a connection-level error. Implementations typically retry on a retryable
     /// connection error (see [`is_retryable_connection_error`]) or a retryable
@@ -115,7 +115,7 @@ const MIN_BACKOFF: Duration = Duration::from_millis(1);
 /// - `max_interval` defaults to `10 * base_interval`.
 /// - `max_interval` must be >= `base_interval`; if not, it is clamped to `base_interval`.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RetryBackoffConfig {
+pub struct RetryBackoffConfig {
     pub(crate) base_interval: Duration,
     pub(crate) max_interval: Duration,
     pub(crate) backoff_multiplier: f64,
@@ -125,7 +125,7 @@ impl RetryBackoffConfig {
     /// Create a new backoff config with the given `base_interval`.
     /// `max_interval` defaults to `10 * base_interval`.
     /// `backoff_multiplier` defaults to `2.0`.
-    pub(crate) fn new(base_interval: Duration) -> Self {
+    pub fn new(base_interval: Duration) -> Self {
         let base_interval = base_interval.max(MIN_BACKOFF);
         Self {
             max_interval: base_interval * 10,
@@ -136,14 +136,14 @@ impl RetryBackoffConfig {
 
     /// Set the maximum backoff interval.
     /// Values < 1ms are treated as 1ms. Values < `base_interval` are clamped to `base_interval`.
-    pub(crate) fn max_interval(mut self, max_interval: Duration) -> Self {
+    pub fn max_interval(mut self, max_interval: Duration) -> Self {
         let max_interval = max_interval.max(MIN_BACKOFF);
         self.max_interval = max_interval.max(self.base_interval);
         self
     }
 
     /// Set the backoff multiplier (default: 2.0).
-    pub(crate) fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
         self.backoff_multiplier = multiplier;
         self
     }
@@ -167,27 +167,27 @@ impl Default for RetryBackoffConfig {
 /// - `num_retries` must be >= 1. Values of 0 are clamped to 1.
 /// - `num_retries` is capped so total attempts (num_retries + 1) never exceed 5.
 #[derive(Debug, Clone)]
-pub(crate) struct RetryConfig {
+pub struct RetryConfig {
     pub(crate) num_retries: u32,
     pub(crate) retry_backoff: RetryBackoffConfig,
 }
 
 impl RetryConfig {
     /// Create a new retry config with defaults.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the number of retries (total attempts = num_retries + 1).
     /// Values of 0 are clamped to 1. Values that would exceed 5 total attempts are capped.
-    pub(crate) fn num_retries(mut self, num_retries: u32) -> Self {
+    pub fn num_retries(mut self, num_retries: u32) -> Self {
         // Safety: clamp panics if min > max. Here min=1, max=MAX_ATTEMPTS-1=4 (const).
         self.num_retries = num_retries.clamp(1, MAX_ATTEMPTS - 1);
         self
     }
 
     /// Set the backoff configuration.
-    pub(crate) fn retry_backoff(mut self, backoff: RetryBackoffConfig) -> Self {
+    pub fn retry_backoff(mut self, backoff: RetryBackoffConfig) -> Self {
         self.retry_backoff = backoff;
         self
     }

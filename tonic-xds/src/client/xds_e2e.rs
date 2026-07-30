@@ -72,6 +72,91 @@ mod test {
             .expect("build xds channel")
     }
 
+    // --- Transport-generic build path (`build_transport_channel`) ---
+    //
+    // The types below are written entirely against tonic-xds' *public* API,
+    // mirroring what an out-of-crate transport (e.g. plain HTTP) would provide:
+    // a `MakeConnector` whose per-endpoint service accepts a `SharedBody`-wrapped
+    // body, plus a caller-supplied `RetryClassifier`. This exercises the generic
+    // stack instead of the built-in gRPC one.
+    use crate::{
+        BoxFuture, ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
+        RetryClassifier, RetryConfig, is_retryable_connection_error,
+    };
+    use http::{Request, Response};
+    use shared_http_body::SharedBody;
+    use std::sync::Arc;
+    use tonic::body::Body as TonicBody;
+    use tonic::transport::Endpoint;
+    use tower::util::BoxCloneSyncService;
+    use tower::{BoxError, ServiceExt as _};
+
+    /// Per-endpoint service: a lazily-connected tonic channel adapted to accept
+    /// a `SharedBody`-wrapped request body, wrapped in `EndpointChannel` for
+    /// in-flight load reporting.
+    type SharedBodyEndpoint = EndpointChannel<
+        BoxCloneSyncService<Request<SharedBody<TonicBody>>, Response<TonicBody>, BoxError>,
+    >;
+
+    /// A non-gRPC retry classifier: retries only connection-level errors, reusing
+    /// the public [`is_retryable_connection_error`] helper.
+    #[derive(Clone)]
+    struct ConnErrorRetryClassifier;
+
+    impl RetryClassifier for ConnErrorRetryClassifier {
+        fn is_retryable<Res>(&self, res: &Result<Response<Res>, BoxError>) -> bool {
+            matches!(res, Err(e) if is_retryable_connection_error(e.as_ref()))
+        }
+    }
+
+    struct SharedBodyConnector;
+
+    impl Connector for SharedBodyConnector {
+        type Service = SharedBodyEndpoint;
+
+        fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+            let channel = Endpoint::from_shared(format!("http://{addr}"))
+                .expect("valid endpoint uri")
+                .connect_lazy();
+            let svc = channel
+                .map_request(|req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new))
+                .map_err(|e| -> BoxError { e.into() });
+            let ep = EndpointChannel::new(BoxCloneSyncService::new(svc));
+            Box::pin(async move { ep })
+        }
+    }
+
+    struct SharedBodyMakeConnector;
+
+    impl MakeConnector for SharedBodyMakeConnector {
+        type Service = SharedBodyEndpoint;
+
+        fn make_connector(
+            &self,
+            _cluster: ClusterConfig<'_>,
+        ) -> Result<Arc<dyn Connector<Service = Self::Service> + Send + Sync>, BoxError> {
+            Ok(Arc::new(SharedBodyConnector))
+        }
+    }
+
+    /// Like [`build_channel`], but drives the transport-generic build path with a
+    /// custom connector and retry classifier. Returns an `XdsChannelGrpc` because
+    /// the outbound body is still a `tonic` body (`B = TonicBody`).
+    fn build_generic_channel(cp_addr: SocketAddr, listener_name: &str) -> XdsChannelGrpc {
+        let bootstrap_json = format!(
+            r#"{{"xds_servers":[{{"server_uri":"http://{cp_addr}"}}],"node":{{"id":"test"}}}}"#
+        );
+        let bootstrap = BootstrapConfig::from_json(&bootstrap_json).expect("parse bootstrap");
+        let target = XdsUri::parse(&format!("xds:///{listener_name}")).expect("parse target");
+        XdsChannelBuilder::new(XdsChannelConfig::new(target).with_bootstrap(bootstrap))
+            .build_transport_channel(
+                SharedBodyMakeConnector,
+                ConnErrorRetryClassifier,
+                RetryConfig::new(),
+            )
+            .expect("build transport channel")
+    }
+
     /// Sends `say_hello` in a loop until a reply starting with `want_prefix` is
     /// observed (xDS resolution and config updates are asynchronous), returning
     /// that reply. Panics if it never arrives.
@@ -152,10 +237,52 @@ mod test {
         let _ = backend.shutdown.send(());
     }
 
-    /// The client is initially routing to
-    /// one cluster, update the RDS route to point at a different cluster and
-    /// assert traffic shifts to the new backend — exercising the control
-    /// plane pushing a live update to a connected client.
+    /// End-to-end test for the transport-generic build path: verifies that a
+    /// channel built via [`XdsChannelBuilder::build_transport_channel`] with a
+    /// caller-supplied connector and [`RetryClassifier`] routes traffic to the
+    /// correct backend, just like the built-in gRPC path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xds_channel_e2e_transport_generic_routes_to_backend() {
+        let backend = spawn_greeter_server("backend", None, None)
+            .await
+            .expect("spawn greeter backend");
+        let backend_addr = backend.addr;
+
+        let (control_plane, cp_addr) = start_control_plane().await;
+
+        // Configure LDS (inline route) -> CDS -> EDS pointing at the backend.
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Lds,
+            HashMap::from([(
+                "my-service".to_string(),
+                config::build_inline_listener("my-service", "my-cluster"),
+            )]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Cds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cluster("my-cluster"),
+            )]),
+        );
+        control_plane.get_service().set_xds_config(
+            &config::AdsTypeUrl::Eds,
+            HashMap::from([(
+                "my-cluster".to_string(),
+                config::build_cla(
+                    "my-cluster",
+                    &[(backend_addr.ip().to_string(), backend_addr.port())],
+                ),
+            )]),
+        );
+
+        let mut client = GreeterClient::new(build_generic_channel(cp_addr, "my-service"));
+        let reply = say_hello_until_prefix(&mut client, "backend:").await;
+        assert_eq!(reply, "backend: world");
+
+        let _ = backend.shutdown.send(());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xds_channel_e2e_route_update_shifts_traffic() {
         let backend_a = spawn_greeter_server("backend-a", None, None)

@@ -22,8 +22,8 @@
  *
  */
 
-use crate::client::cluster::ClusterClientRegistryGrpc;
-use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+use crate::client::cluster::{ClusterClientRegistry, ClusterClientRegistryGrpc};
+use crate::client::endpoint::{EndpointAddress, EndpointChannel, MakeConnector};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
@@ -34,19 +34,23 @@ use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use crate::{TonicCallCredentials, XdsUri};
-use http::Request;
+use http::{Request, Response};
+use http_body::Body;
+use shared_http_body::SharedBody;
 #[cfg(feature = "_tls-any")]
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
-use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
+use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
 
-use crate::client::retry::{GrpcRetryPolicy, RetryLayer};
+use crate::client::retry::{
+    GrpcRetryPolicy, RetryClassifier, RetryConfig, RetryLayer, RetryPolicy,
+};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -297,11 +301,48 @@ impl XdsChannelBuilder {
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
-        let bootstrap = match self.config.bootstrap.clone() {
+        let bootstrap = self.load_bootstrap()?;
+
+        // The cert-provider registry is gRPC-specific (gRFC A29): it is consumed
+        // only by the built-in gRPC connector factory. Build it here, before the
+        // bootstrap is moved into `build_xds_runtime`, so the generic transport
+        // path (`build_transport_channel`) never pays for it.
+        #[cfg(feature = "_tls-any")]
+        let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
+            &bootstrap.certificate_providers,
+            self.cert_providers.clone(),
+        )?);
+
+        let (xds_client, cache, resource_manager) = self.build_xds_runtime(bootstrap)?;
+
+        Ok(self.build_from_cache(
+            cache,
+            #[cfg(feature = "_tls-any")]
+            cert_provider_registry,
+            xds_client,
+            resource_manager,
+        ))
+    }
+
+    /// Loads the bootstrap config from the builder, falling back to the
+    /// environment (`GRPC_XDS_BOOTSTRAP` / `GRPC_XDS_BOOTSTRAP_CONFIG`).
+    fn load_bootstrap(&self) -> Result<BootstrapConfig, BuildError> {
+        Ok(match self.config.bootstrap.clone() {
             Some(b) => b,
             None => BootstrapConfig::from_env()?,
-        };
+        })
+    }
 
+    /// Builds the transport-agnostic xDS runtime: the ADS [`XdsClient`], the
+    /// shared [`XdsCache`], and the [`XdsResourceManager`] that drives it.
+    ///
+    /// This is everything both the gRPC and the generic transport build paths
+    /// need, and nothing gRPC-specific (the cert-provider registry is built by
+    /// the caller). Consumes `bootstrap` (its node is moved into the client).
+    fn build_xds_runtime(
+        &self,
+        bootstrap: BootstrapConfig,
+    ) -> Result<(XdsClient, Arc<XdsCache>, XdsResourceManager), BuildError> {
         let listener_name = self.config.target_uri.target.clone();
 
         let server_uri = bootstrap.server_uri().to_owned();
@@ -326,12 +367,6 @@ impl XdsChannelBuilder {
             transport_builder = transport_builder.with_call_credentials(creds);
         }
 
-        #[cfg(feature = "_tls-any")]
-        let cert_provider_registry = Arc::new(CertProviderRegistry::from_bootstrap(
-            &bootstrap.certificate_providers,
-            self.cert_providers.clone(),
-        )?);
-
         let node = Node::try_from(bootstrap.node)?;
         let client_config =
             ClientConfig::new(node, &server_uri).with_target(self.config.target_uri.to_string());
@@ -346,13 +381,7 @@ impl XdsChannelBuilder {
         let resource_manager =
             XdsResourceManager::new(xds_client.clone(), cache.clone(), listener_name);
 
-        Ok(self.build_from_cache(
-            cache,
-            #[cfg(feature = "_tls-any")]
-            cert_provider_registry,
-            xds_client,
-            resource_manager,
-        ))
+        Ok((xds_client, cache, resource_manager))
     }
 
     /// Internal builder that wires the service stack from a pre-built cache.
@@ -378,30 +407,135 @@ impl XdsChannelBuilder {
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
-        let retry_policy = GrpcRetryPolicy::default();
+        let resources = Arc::new(XdsChannelResources {
+            _resource_manager: resource_manager,
+            _xds_client: xds_client,
+        });
+
+        // gRPC bridges the retry engine's cloneable `SharedBody` back into a
+        // `tonic` body, which is what the built-in `Channel` connector expects.
+        self.build_stack(
+            router,
+            self.pre_route.clone(),
+            discovery,
+            Arc::new(ClusterClientRegistryGrpc::new()),
+            GrpcRetryPolicy::default(),
+            Some(resources),
+            |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
+        )
+    }
+
+    /// Wires the routing -> retry -> load-balancing service stack over a
+    /// pre-built cluster discovery and type-erases it into a cloneable,
+    /// `Send + Sync` boxed [`tower::Service`]. This is the transport-generic
+    /// core shared by [`build_grpc_channel`](Self::build_grpc_channel) and
+    /// [`build_transport_channel`](Self::build_transport_channel).
+    ///
+    /// - `S` is the per-endpoint service produced by the cluster discovery.
+    /// - `B` is the inbound request body; `EB` the body the per-endpoint service
+    ///   accepts; `Res` the response body.
+    /// - `post_retry_map` bridges the retry engine's cloneable [`SharedBody`]
+    ///   (needed so a request can be replayed) back to `EB`. For gRPC this
+    ///   rewraps it into a `tonic` body; for a transport whose service already
+    ///   accepts `SharedBody` it is the identity.
+    #[allow(clippy::too_many_arguments)]
+    fn build_stack<S, C, B, EB, Res, MapFn>(
+        &self,
+        router: Arc<dyn Router>,
+        interceptor: Option<Arc<dyn PreRouteInterceptor>>,
+        discovery: Arc<dyn ClusterDiscovery<EndpointAddress, S>>,
+        cluster_registry: Arc<ClusterClientRegistry<Request<EB>, Response<Res>>>,
+        retry_policy: RetryPolicy<C>,
+        resources: Option<Arc<XdsChannelResources>>,
+        post_retry_map: MapFn,
+    ) -> BoxCloneSyncService<Request<B>, Response<Res>, BoxError>
+    where
+        S: Service<Request<EB>, Response = Response<Res>> + Load + Send + 'static,
+        <S as Service<Request<EB>>>::Error: Into<BoxError>,
+        <S as Service<Request<EB>>>::Future: Send,
+        <S as Load>::Metric: Debug,
+        C: RetryClassifier + Send + Sync + 'static,
+        B: Body + Unpin + Send + 'static,
+        B::Data: Clone + Send + Sync,
+        B::Error: Clone + Send + Sync,
+        EB: Send + 'static,
+        Res: Send + 'static,
+        MapFn: FnMut(Request<SharedBody<B>>) -> Request<EB> + Clone + Send + Sync + 'static,
+    {
+        let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
+        let retry_layer = RetryLayer::new(retry_policy);
+        let lb_service = XdsLbService::new(cluster_registry, discovery);
+        let inner = ServiceBuilder::new()
+            .layer(routing_layer)
+            .layer(retry_layer)
+            .map_request(post_retry_map)
+            .service(lb_service);
+
+        BoxCloneSyncService::new(XdsChannel {
+            config: self.config.clone(),
+            inner,
+            _resources: resources,
+        })
+    }
+
+    /// Builds a transport-generic xDS channel: the routing + retry +
+    /// load-balancing stack over a caller-provided [`MakeConnector`], returned
+    /// as a type-erased, cloneable, `Send + Sync` [`tower::Service`].
+    ///
+    /// Unlike [`build_grpc_channel`](Self::build_grpc_channel), the per-endpoint
+    /// transport is supplied by the caller via `make_connector`, and the retry
+    /// behavior by `retry_classifier` (which decides retryability for that
+    /// transport) plus `retry_config`. The gRPC channel is the special case
+    /// where the connector speaks HTTP/2 + gRPC and the classifier follows the
+    /// gRPC retry spec.
+    ///
+    /// The returned service accepts `http::Request<B>` and yields
+    /// `http::Response<Res>`, where `B` / `Res` are the request / response body
+    /// types of the caller's transport. The caller's connector service accepts a
+    /// [`SharedBody`]-wrapped body so that requests can be cloned for retries.
+    pub fn build_transport_channel<MC, C, B, Res>(
+        &self,
+        make_connector: MC,
+        retry_classifier: C,
+        retry_config: RetryConfig,
+    ) -> Result<BoxCloneSyncService<Request<B>, Response<Res>, BoxError>, BuildError>
+    where
+        MC: MakeConnector,
+        MC::Service: Service<Request<SharedBody<B>>, Response = Response<Res>> + Load,
+        <MC::Service as Service<Request<SharedBody<B>>>>::Error: Into<BoxError>,
+        <MC::Service as Service<Request<SharedBody<B>>>>::Future: Send,
+        <MC::Service as Load>::Metric: Debug,
+        C: RetryClassifier + Send + Sync + 'static,
+        B: Body + Unpin + Send + 'static,
+        B::Data: Clone + Send + Sync,
+        B::Error: Clone + Send + Sync,
+        Res: Send + 'static,
+    {
+        let bootstrap = self.load_bootstrap()?;
+        let (xds_client, cache, resource_manager) = self.build_xds_runtime(bootstrap)?;
+
+        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
+        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> =
+            Arc::new(XdsClusterDiscovery::new(cache, make_connector));
 
         let resources = Arc::new(XdsChannelResources {
             _resource_manager: resource_manager,
             _xds_client: xds_client,
         });
 
-        let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
-        let retry_layer = RetryLayer::new(retry_policy);
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
-        let inner = ServiceBuilder::new()
-            .layer(routing_layer)
-            .layer(retry_layer)
-            .map_request(|req: Request<shared_http_body::SharedBody<TonicBody>>| {
-                req.map(TonicBody::new)
-            })
-            .service(lb_service);
+        let retry_policy = RetryPolicy::new(retry_config, retry_classifier);
 
-        BoxCloneSyncService::new(XdsChannel {
-            config: self.config.clone(),
-            inner,
-            _resources: Some(resources),
-        })
+        // The caller's connector already accepts `SharedBody`, so the post-retry
+        // map is the identity — no body rewrapping is needed.
+        Ok(self.build_stack(
+            router,
+            self.pre_route.clone(),
+            discovery,
+            Arc::new(ClusterClientRegistry::new()),
+            retry_policy,
+            Some(resources),
+            |req: Request<SharedBody<B>>| req,
+        ))
     }
 
     /// Builds an `XdsChannelGrpc`, which is a type-erased gRPC channel.
@@ -421,22 +555,15 @@ impl XdsChannelBuilder {
         retry_policy: GrpcRetryPolicy,
         interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
-        let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
-        let retry_layer = RetryLayer::new(retry_policy);
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
-        let inner = ServiceBuilder::new()
-            .layer(routing_layer)
-            .layer(retry_layer)
-            .map_request(|req: Request<shared_http_body::SharedBody<TonicBody>>| {
-                req.map(TonicBody::new)
-            })
-            .service(lb_service);
-        BoxCloneSyncService::new(XdsChannel {
-            config: self.config.clone(),
-            inner,
-            _resources: None,
-        })
+        self.build_stack(
+            router,
+            interceptor,
+            discovery,
+            Arc::new(ClusterClientRegistryGrpc::new()),
+            retry_policy,
+            None,
+            |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
+        )
     }
 
     /// Channel-level authority used as the routing key for matching against
