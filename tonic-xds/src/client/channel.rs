@@ -367,6 +367,18 @@ impl XdsChannelBuilder {
         resource_manager: XdsResourceManager,
     ) -> XdsChannelGrpc {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
+
+        // Retry config is control-plane-driven from RDS, per route. It is parsed
+        // and validated once, when the `RouteConfiguration` is validated. The
+        // routing layer (outer) stamps the matched route's shared retry config
+        // into the request's `RouteDecision`; the retry layer reads the shared
+        // config `Arc` and instantiates a per-request policy from it, so the
+        // request hot path does no parsing or allocation. The default below is
+        // the fallback used when a request carries no route retry config (non-xDS
+        // callers, or a route with no retry policy). See
+        // [`RetryLayer`](crate::client::retry::RetryLayer).
+        let retry_layer = RetryLayer::new(GrpcRetryPolicy::default());
+
         #[cfg(feature = "_tls-any")]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
@@ -378,7 +390,6 @@ impl XdsChannelBuilder {
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
         > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
-        let retry_policy = GrpcRetryPolicy::default();
 
         let resources = Arc::new(XdsChannelResources {
             _resource_manager: resource_manager,
@@ -386,7 +397,6 @@ impl XdsChannelBuilder {
         });
 
         let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
-        let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
@@ -527,6 +537,7 @@ mod tests {
             Ok(RouteDecision {
                 cluster: "test-cluster".to_string(),
                 request_hash: None,
+                retry_config: None,
             })
         }
     }
@@ -680,9 +691,7 @@ mod tests {
 
         let retry_policy = GrpcRetryPolicy::new(
             RetryConfig::new().num_retries(1),
-            GrpcRetryClassifier {
-                retry_on: vec![tonic::Code::Unavailable],
-            },
+            GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]),
         );
 
         let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(
@@ -734,6 +743,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster(cluster_name.to_string()),
+                    retry_config: None,
                 }],
             }],
             metadata: Default::default(),

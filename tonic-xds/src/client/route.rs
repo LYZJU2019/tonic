@@ -22,6 +22,7 @@
  *
  */
 
+use crate::client::retry::GrpcRetrySharedConfig;
 use crate::common::async_util::BoxFuture;
 use crate::xds::resource::route_config::{RouteConfigMetadata, RouteConfigResource};
 use crate::xds::routing::RoutingError;
@@ -50,6 +51,14 @@ pub(crate) struct RouteDecision {
     // Populated by the routing layer; consumed by the ring-hash picker (later PR).
     #[allow(dead_code)]
     pub request_hash: Option<u64>,
+    /// The matched route's shared retry config (RDS `RouteAction.retry_policy`),
+    /// or `None` when the route specifies no retry. Carried from the same config
+    /// snapshot the routing decision was made on, so the retry layer applies the
+    /// config for exactly the route this request took (gRFC A44). Already parsed
+    /// and validated at RDS-validation time and held behind an `Arc`, so the
+    /// retry layer instantiates a per-request policy from it with a pointer clone
+    /// (see `GrpcRetrySharedConfig`).
+    pub retry_config: Option<Arc<GrpcRetrySharedConfig>>,
 }
 
 /// A hook that runs before xDS route selection.
@@ -227,6 +236,7 @@ mod tests {
             Ok(RouteDecision {
                 cluster: "test-cluster".to_string(),
                 request_hash: None,
+                retry_config: None,
             })
         }
     }
@@ -301,6 +311,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("c".into()),
+                    retry_config: None,
                 }],
             }],
             metadata: RouteConfigMetadata::from_encoded(
@@ -338,6 +349,7 @@ mod tests {
                 Ok(RouteDecision {
                     cluster: "c".to_string(),
                     request_hash: None,
+                    retry_config: None,
                 })
             }
         }
@@ -442,6 +454,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster(cluster.into()),
+                retry_config: None,
             }
         }
 
