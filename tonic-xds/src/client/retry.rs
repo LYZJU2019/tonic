@@ -129,7 +129,9 @@ impl RetryBackoffConfig {
     pub(crate) fn new(base_interval: Duration) -> Self {
         let base_interval = base_interval.max(MIN_BACKOFF);
         Self {
-            max_interval: base_interval * 10,
+            // `checked_mul` guards the (already range-checked) `base_interval`
+            // against overflow; the fallback keeps `max_interval >= base`.
+            max_interval: base_interval.checked_mul(10).unwrap_or(base_interval),
             base_interval,
             backoff_multiplier: 2.0,
         }
@@ -206,14 +208,9 @@ impl Default for RetryConfig {
 /// Default gRPC [`RetryClassifier`]: retries on a retryable connection error or a
 /// retryable gRPC status code, and stamps the `grpc-previous-rpc-attempts` header
 /// on each retry per the gRPC spec.
-///
-/// The retryable gRPC status codes are parsed once per `RouteConfiguration` and
-/// held behind an `Arc<[Code]>`, so cloning a classifier (per request, or on each
-/// tower retry) is a pointer bump rather than a re-parse or re-allocation. A new
-/// set is built only when RDS changes; see [`RetryLayer`].
 #[derive(Debug, Clone)]
 pub(crate) struct GrpcRetryClassifier {
-    /// gRPC status codes that should be retried. Shared (parsed once per config).
+    /// gRPC status codes that should be retried.
     retry_on: Arc<[tonic::Code]>,
 }
 
@@ -266,27 +263,24 @@ fn make_backoff(config: &RetryBackoffConfig) -> backoff::ExponentialBackoff {
         .build()
 }
 
-/// Immutable, shared retry configuration — the transport-agnostic knobs
-/// (attempt cap, backoff) plus the transport-specific classifier `C`. Built and
-/// validated **once** when a `RouteConfiguration` is validated (see
-/// [`GrpcRetrySharedConfig::from_route_retry`]) and shared across every request
-/// that matches the route via an [`Arc`], so per-request setup never re-parses
-/// or re-allocates.
+/// Immutable, shared retry configuration: the transport-agnostic knobs (attempt
+/// cap, backoff) plus the transport-specific classifier `C`. Built once when a
+/// `RouteConfiguration` is validated (see
+/// [`GrpcRetrySharedConfig::from_route_retry`]) and shared across matching
+/// requests via an [`Arc`].
 ///
-/// Kept separate from the per-request retry *state* ([`RetryPolicy`]) so that
-/// instantiating a policy for a request is just an `Arc` pointer clone plus a
-/// zero-field state init — see [`RetryPolicy::from_shared`].
+/// Kept separate from the per-request retry state ([`RetryPolicy`]) so that
+/// instantiating a policy is an `Arc` clone plus a zero-field init.
 #[derive(Debug)]
 pub(crate) struct RetrySharedConfig<C> {
-    /// Attempt cap and backoff schedule, shared by every [`RetryClassifier`].
+    /// Attempt cap and backoff schedule.
     config: RetryConfig,
     /// Decides retryability and per-retry request mutation for the transport.
     classifier: C,
 }
 
 impl<C> RetrySharedConfig<C> {
-    /// Create a shared retry config from an attempt/backoff [`RetryConfig`] and a
-    /// transport classifier.
+    /// Create a shared retry config from a [`RetryConfig`] and a classifier.
     pub(crate) fn new(config: RetryConfig, classifier: C) -> Self {
         Self { config, classifier }
     }
@@ -298,23 +292,14 @@ impl<C: Default> Default for RetrySharedConfig<C> {
     }
 }
 
-/// Per-request retry *state* — a pointer to the shared, immutable
+/// Per-request retry *state*: a pointer to the shared, immutable
 /// [`RetrySharedConfig`] plus the mutable state for one request (backoff cursor
-/// and attempt counter). Transport-specific decisions live in the classifier `C`
-/// (see [`RetryClassifier`]).
-///
-/// Instantiating one for a request ([`RetryPolicy::from_shared`]) is a hot-path
-/// operation: it clones a single `Arc` (a pointer bump) and zero-inits the state
-/// fields — no parsing, allocation, or config copying.
-///
-/// Implements [`tower::retry::Policy`]. Tower's `Retry` service clones the policy
-/// for each request, so `backoff` and `attempts` track per-request retry state
-/// while the shared config stays behind the `Arc`. The retry *state machine*
-/// stays entirely in tower's `Retry`/`ResponseFuture`; this type only implements
-/// the `Policy` trait, so no state machine is reimplemented here.
+/// and attempt counter). Implements [`tower::retry::Policy`]; tower's `Retry`
+/// clones it per request, so the state is per-request while the config stays
+/// shared behind the `Arc`.
 #[derive(Clone, Debug)]
 pub(crate) struct RetryPolicy<C> {
-    /// Immutable config shared across all requests on this route (pointer clone).
+    /// Immutable config shared across all requests on this route.
     shared: Arc<RetrySharedConfig<C>>,
     /// Backoff state for the current request, created from config on first retry.
     backoff: Option<backoff::ExponentialBackoff>,
@@ -323,17 +308,14 @@ pub(crate) struct RetryPolicy<C> {
 }
 
 impl<C> RetryPolicy<C> {
-    /// Create a policy from a shared config and a classifier, allocating a fresh
-    /// [`Arc`] for the shared config. Prefer [`from_shared`](Self::from_shared)
-    /// on the hot path, where the shared config already lives behind an `Arc`.
+    /// Create a policy from a config and classifier, allocating the shared `Arc`.
+    /// Prefer [`from_shared`](Self::from_shared) on the hot path.
     pub(crate) fn new(config: RetryConfig, classifier: C) -> Self {
         Self::from_shared(Arc::new(RetrySharedConfig::new(config, classifier)))
     }
 
-    /// Instantiate per-request retry state from an already-shared config.
-    ///
-    /// Hot path: a single `Arc` pointer clone (the caller's) plus a zero-field
-    /// state init. No parsing, allocation, or config copy.
+    /// Instantiate per-request state from an already-shared config: an `Arc`
+    /// pointer clone plus a zero-field init. This is the hot path.
     pub(crate) fn from_shared(shared: Arc<RetrySharedConfig<C>>) -> Self {
         Self {
             shared,
@@ -342,11 +324,14 @@ impl<C> RetryPolicy<C> {
         }
     }
 
-    /// Get or create the backoff, and advance it to the next delay.
-    ///
-    /// Only called on the cold path (when a request is actually being retried),
-    /// never for successful requests. Borrows `shared` and `backoff` disjointly,
-    /// so it reads the shared backoff config by reference without cloning.
+    /// Consume the policy and return its shared config, discarding the
+    /// per-request state.
+    pub(crate) fn into_shared(self) -> Arc<RetrySharedConfig<C>> {
+        self.shared
+    }
+
+    /// Get or lazily create the backoff and advance it to the next delay. Only
+    /// reached when a request is actually being retried.
     fn backoff_next(&mut self) -> Duration {
         let backoff_config = &self.shared.config.retry_backoff;
         let backoff = self
@@ -366,16 +351,17 @@ impl<C: Default> Default for RetryPolicy<C> {
 
 impl RetrySharedConfig<GrpcRetryClassifier> {
     /// Build a shared gRPC retry config from a route's [`RouteRetryConfig`] (RDS
-    /// `RouteAction.retry_policy`). Unset Envoy fields fall back to
-    /// [`RetryConfig`] defaults.
+    /// `RouteAction.retry_policy`), parsing `retry_on` into [`tonic::Code`]s.
+    /// Unset Envoy fields fall back to [`RetryConfig`] defaults.
     ///
-    /// This is where `retry_on` is parsed into [`tonic::Code`]s and the
-    /// retryable-code set is allocated, so it runs **once, when the
-    /// `RouteConfiguration` is validated** — not per request. The result is
-    /// wrapped in an [`Arc`] and carried on the matched route, so instantiating a
-    /// per-request policy is just a pointer clone (see
-    /// [`RetryPolicy::from_shared`]).
-    pub(crate) fn from_route_retry(retry: &RouteRetryConfig) -> Self {
+    /// Returns `None` when no `retry_on` condition maps to a gRPC status code
+    /// (gRFC A44): an empty set means "no retry policy" for the route, so it
+    /// falls back to the layer default rather than masking connection retries.
+    pub(crate) fn from_route_retry(retry: &RouteRetryConfig) -> Option<Self> {
+        let retry_on = grpc_retry_on_codes(&retry.retry_on);
+        if retry_on.is_empty() {
+            return None;
+        }
         let mut config = RetryConfig::new();
         if let Some(num_retries) = retry.num_retries {
             config = config.num_retries(num_retries);
@@ -387,10 +373,7 @@ impl RetrySharedConfig<GrpcRetryClassifier> {
             }
             config = config.retry_backoff(backoff);
         }
-        Self::new(
-            config,
-            GrpcRetryClassifier::new(grpc_retry_on_codes(&retry.retry_on)),
-        )
+        Some(Self::new(config, GrpcRetryClassifier::new(retry_on)))
     }
 }
 
@@ -453,61 +436,34 @@ where
 /// Non-breaking alias: existing gRPC callers keep the same name and behavior.
 pub(crate) type GrpcRetryPolicy = RetryPolicy<GrpcRetryClassifier>;
 
-/// Shared, immutable gRPC retry config (attempt cap, backoff, and the retryable
-/// [`tonic::Code`] set). Built and validated once per `RouteConfiguration` (see
-/// [`RetrySharedConfig::from_route_retry`]) and carried behind an [`Arc`] on the
-/// matched route, so instantiating a per-request [`GrpcRetryPolicy`] is a pointer
-/// clone (see [`RetryPolicy::from_shared`]).
+/// Shared, immutable gRPC retry config (attempt cap, backoff, retryable
+/// [`tonic::Code`] set); the [`GrpcRetryClassifier`] specialization of
+/// [`RetrySharedConfig`].
 pub(crate) type GrpcRetrySharedConfig = RetrySharedConfig<GrpcRetryClassifier>;
 
 /// Tower [`Layer`] that wraps a gRPC service with retry support.
 ///
-/// Converts the request body into a [`SharedBody`] (cloneable) and constructs
-/// a fresh [`tower::retry::Retry`] service per request so that each request
-/// gets its own retry state.
-///
-/// # Per-route, control-plane-driven policy
-///
-/// The active retry config is selected **per request** from the route the
-/// request matched. The routing layer (which runs immediately outside this one)
-/// stamps the matched route's shared retry config into the request's
-/// [`RouteDecision`], taken from the same config snapshot it routed with. Because
-/// both layers read one snapshot, routing and retry always act on the same RDS
-/// version — there is no cross-layer version skew — and each request retries
-/// according to the exact route it took (gRFC A44).
-///
+/// Converts the request body into a cloneable [`SharedBody`] and builds a fresh
+/// [`tower::retry::Retry`] per request. The retry config is selected per request
+/// from the route the request matched: the routing layer (just outside this one)
+/// stamps the matched route's shared config into the request's [`RouteDecision`].
 /// Requests with no [`RouteDecision`] (non-xDS callers) or whose matched route
 /// carries no retry policy use `fallback`.
 ///
-/// # Hot path
-///
-/// The gRPC retry config (`retry_on` codes, attempt cap, backoff) is parsed and
-/// validated **once**, when the `RouteConfiguration` is validated, and shared
-/// behind an [`Arc`] on the matched route (see [`GrpcRetrySharedConfig`]). This
-/// layer never parses or derives on the request path: it reads the shared config
-/// `Arc` from the [`RouteDecision`], clones the pointer, and instantiates a
-/// [`GrpcRetryPolicy`] with fresh per-request state (see
-/// [`RetryPolicy::from_shared`]). No parsing, allocation, or locking.
-///
-/// This layer is gRPC-specific because it reads the concrete [`RouteDecision`]
-/// extension; the retry *engine* ([`RetryPolicy`], [`RetrySharedConfig`], and the
-/// [`RetryClassifier`] seam) stays transport-agnostic.
+/// gRPC-specific because it reads the concrete [`RouteDecision`] extension; the
+/// retry engine ([`RetryPolicy`], [`RetrySharedConfig`], [`RetryClassifier`])
+/// stays transport-agnostic.
 #[derive(Clone)]
 pub(crate) struct RetryLayer {
-    /// Shared config used when a request carries no per-route retry config
-    /// (non-xDS callers, or a matched route with no `RouteAction.retry_policy`).
+    /// Config used when a request carries no per-route retry config.
     fallback: Arc<GrpcRetrySharedConfig>,
 }
 
 impl RetryLayer {
-    /// Create a retry layer whose `fallback` policy is used when a request
-    /// carries no per-route retry config. Only the policy's shared config is
-    /// kept; its per-request state is discarded. Route-specific configs are read
-    /// from the request's [`RouteDecision`] (see [`RetryLayer`]).
-    pub(crate) fn new(fallback: GrpcRetryPolicy) -> Self {
-        Self {
-            fallback: fallback.shared,
-        }
+    /// Create a layer with the given `fallback` shared config, used when a
+    /// request carries no per-route retry config (see [`RetryLayer`]).
+    pub(crate) fn new(fallback: Arc<GrpcRetrySharedConfig>) -> Self {
+        Self { fallback }
     }
 }
 
@@ -523,15 +479,12 @@ impl<S> Layer<S> for RetryLayer {
 }
 
 /// Service that converts request bodies to [`SharedBody`] and retries via
-/// [`tower::retry::Retry`]. The retry config is selected per request from the
-/// route the request matched (via [`RouteDecision`]) and is already parsed and
-/// shared behind an [`Arc`], so the hot path performs no parsing or allocation
-/// (see [`RetryLayer`]).
+/// [`tower::retry::Retry`], selecting the per-request config from the matched
+/// route's [`RouteDecision`] (see [`RetryLayer`]).
 #[derive(Clone)]
 pub(crate) struct RetryService<S> {
     inner: S,
-    /// Shared config used when a request carries no per-route retry config,
-    /// shared (via `Arc`) with the layer and every per-request clone.
+    /// Config used when a request carries no per-route retry config.
     fallback: Arc<GrpcRetrySharedConfig>,
 }
 
@@ -559,13 +512,8 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        // Select the shared retry config for the route this request matched. The
-        // routing layer (just outside this one) stamped the matched route's shared
-        // config into the `RouteDecision` from the same config snapshot it routed
-        // with. The config is already parsed and validated (done once when the
-        // `RouteConfiguration` was validated), so this is a pointer clone plus a
-        // zero-field state init — no parsing or allocation. Fall back when the
-        // request carries no route retry config.
+        // Use the shared config the routing layer stamped into the RouteDecision
+        // for the route this request matched, falling back when it carries none.
         let shared = request
             .extensions()
             .get::<RouteDecision>()
@@ -807,7 +755,7 @@ mod tests {
         assert_eq!(config.retry_backoff, backoff);
     }
 
-    // --- Building a policy from a route's retry config ---
+    // --- from_route_retry tests ---
 
     #[test]
     fn test_from_route_retry_maps_fields() {
@@ -817,7 +765,7 @@ mod tests {
             base_interval: Some(Duration::from_millis(100)),
             max_interval: Some(Duration::from_millis(1000)),
         };
-        let shared = GrpcRetrySharedConfig::from_route_retry(&retry);
+        let shared = GrpcRetrySharedConfig::from_route_retry(&retry).expect("codes present");
         assert_eq!(shared.config.num_retries, 3);
         assert_eq!(
             shared.config.retry_backoff.base_interval,
@@ -835,14 +783,13 @@ mod tests {
 
     #[test]
     fn test_from_route_retry_unset_fields_use_defaults() {
-        // Only retry_on set: num_retries and backoff fall back to RetryConfig defaults.
         let retry = RouteRetryConfig {
             retry_on: "cancelled".into(),
             num_retries: None,
             base_interval: None,
             max_interval: None,
         };
-        let shared = GrpcRetrySharedConfig::from_route_retry(&retry);
+        let shared = GrpcRetrySharedConfig::from_route_retry(&retry).expect("codes present");
         assert_eq!(shared.config.num_retries, 1);
         assert_eq!(shared.config.retry_backoff, RetryBackoffConfig::default());
         assert_eq!(
@@ -851,28 +798,39 @@ mod tests {
         );
     }
 
-    // --- Per-request policy instantiation from a shared config (hot path) ---
+    #[test]
+    fn test_from_route_retry_empty_codes_yields_none() {
+        // `retry_on` with only non-gRPC tokens maps to no gRPC codes, so no
+        // policy is produced and connection retries are not masked (gRFC A44).
+        let retry = RouteRetryConfig {
+            retry_on: "5xx,reset".into(),
+            num_retries: Some(3),
+            base_interval: None,
+            max_interval: None,
+        };
+        assert!(GrpcRetrySharedConfig::from_route_retry(&retry).is_none());
+    }
+
+    // --- from_shared tests ---
 
     #[test]
     fn from_shared_instantiates_zeroed_state_sharing_config() {
-        // The hot path clones the shared-config `Arc` and zero-inits per-request
-        // state — no parsing or config copy.
-        let shared = Arc::new(GrpcRetrySharedConfig::from_route_retry(&RouteRetryConfig {
-            retry_on: "unavailable".into(),
-            num_retries: Some(2),
-            base_interval: None,
-            max_interval: None,
-        }));
+        let shared = Arc::new(
+            GrpcRetrySharedConfig::from_route_retry(&RouteRetryConfig {
+                retry_on: "unavailable".into(),
+                num_retries: Some(2),
+                base_interval: None,
+                max_interval: None,
+            })
+            .expect("codes present"),
+        );
         let policy = RetryPolicy::from_shared(Arc::clone(&shared));
 
-        // Fresh per-request state.
         assert_eq!(policy.attempts, 0);
         assert!(policy.backoff.is_none());
-        // The parsed config is shared by pointer, not copied.
         assert!(Arc::ptr_eq(&policy.shared, &shared));
         assert_eq!(policy.shared.config.num_retries, 2);
 
-        // A second policy from the same shared config points at the same config.
         let policy2 = RetryPolicy::from_shared(Arc::clone(&shared));
         assert!(Arc::ptr_eq(&policy.shared, &policy2.shared));
     }

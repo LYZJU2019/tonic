@@ -43,7 +43,7 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use tokio::sync::watch;
 
-use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router};
+use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
 use crate::common::async_util::AbortOnDrop;
 use crate::xds::cache::XdsCache;
 use crate::xds::resource::hash_policy::HashPolicyConfig;
@@ -66,7 +66,7 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// config is available, matching standard gRPC behavior where RPCs wait for the
 /// resolver's first update. Subsequent RPCs read the config lock-free.
 pub(crate) struct XdsRouter {
-    route_config: Arc<ArcSwapOption<RouteConfigResource>>,
+    route_config: Arc<ArcSwapOption<RoutingSnapshot>>,
     ready_rx: watch::Receiver<bool>,
     _watch_task: AbortOnDrop,
 }
@@ -85,7 +85,9 @@ impl XdsRouter {
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
-                rc.store(Some(config));
+                // Compile the retry configs once per RDS update, bundled with the
+                // resource so routing and retry read one consistent version.
+                rc.store(Some(Arc::new(RoutingSnapshot::new(config))));
                 // Signal readiness on the first config, then drop the sender.
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(true);
@@ -100,7 +102,7 @@ impl XdsRouter {
     }
 
     /// The route config currently in effect, or `None` if none has arrived yet.
-    pub(crate) fn snapshot(&self) -> Option<Arc<RouteConfigResource>> {
+    pub(crate) fn snapshot(&self) -> Option<Arc<RoutingSnapshot>> {
         self.route_config.load_full()
     }
 }
@@ -126,7 +128,7 @@ impl Router for XdsRouter {
     fn route(
         &self,
         input: &RouteInput<'_>,
-        config: &RouteConfigResource,
+        config: &RoutingSnapshot,
     ) -> Result<RouteDecision, RoutingError> {
         resolve_route(config, input.authority, input.headers)
     }
@@ -134,7 +136,7 @@ impl Router for XdsRouter {
 
 /// Resolve a route decision from the given config, authority, and headers.
 fn resolve_route(
-    rc: &RouteConfigResource,
+    rc: &RoutingSnapshot,
     authority: &str,
     headers: &http::HeaderMap,
 ) -> Result<RouteDecision, RoutingError> {
@@ -150,13 +152,11 @@ fn resolve_route(
             .to_string(),
     };
 
-    // Carry the matched route's shared retry config (if any) so the retry layer
-    // applies the config for exactly the route this request took (gRFC A44). This
-    // is a cheap `Arc` clone of an already-parsed, validated config; the retry
-    // layer instantiates a per-request policy from it with no allocation. Because
-    // routing and retry read the same config snapshot, both act on the same RDS
-    // version (no cross-layer skew).
-    let retry_config = route.retry_config.clone();
+    // Look up the matched route's compiled retry config (if any) from the same
+    // snapshot, so the retry layer applies the config for exactly the route this
+    // request took (gRFC A44). This is a map lookup plus a cheap `Arc` clone;
+    // routing and retry read one RDS version, so there is no cross-layer skew.
+    let retry_config = rc.retry_for(route.retry_config.as_ref());
 
     // gRFC A42 ring-hash request hash. The policy list is empty for now, so
     // `request_hash` resolves to `None` and the ring-hash picker falls back to a

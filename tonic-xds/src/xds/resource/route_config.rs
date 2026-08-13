@@ -39,7 +39,6 @@ use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
 use super::string_matcher::StringMatcher;
-use crate::client::retry::GrpcRetrySharedConfig;
 
 /// A `typed_filter_metadata` entry — a `google.protobuf.Any` (a type URL plus an
 /// encoded message value).
@@ -152,14 +151,9 @@ pub(crate) struct RouteConfigResource {
     pub metadata: RouteConfigMetadata,
 }
 
-/// Raw Envoy retry settings parsed from a `RouteAction.retry_policy` or a
-/// `VirtualHost.retry_policy` (RDS), used only as an intermediate carrier during
-/// validation. Both proto fields are the same Envoy `RetryPolicy` message.
-///
-/// This is the transport-neutral shape straight from the proto;
-/// [`GrpcRetrySharedConfig::from_route_retry`] turns it into the validated,
-/// gRPC-specific shared config that routes actually carry (see
-/// [`RouteConfig::retry_config`]).
+/// Validated Envoy retry settings (gRFC A44) parsed from a `RouteAction` or
+/// `VirtualHost` `retry_policy` (RDS). A resource-layer type; the routing layer
+/// compiles it into the gRPC retry config once per RDS update.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteRetryConfig {
     /// Envoy `retry_on` conditions, comma-separated (e.g. `"unavailable"`).
@@ -173,30 +167,82 @@ pub(crate) struct RouteRetryConfig {
 }
 
 impl RouteRetryConfig {
-    /// Parse an Envoy `RetryPolicy` proto into a [`RouteRetryConfig`].
-    fn from_proto(rp: &RetryPolicy) -> Self {
+    /// Parse and validate an Envoy `RetryPolicy` (gRFC A44). Returns
+    /// `Err(Validation)` — so the xDS client NACKs — when `num_retries < 1`, or
+    /// when `retry_back_off` is set with a `base_interval` or `max_interval`
+    /// that is not greater than zero.
+    fn from_proto(rp: &RetryPolicy) -> xds_client::Result<Self> {
+        let num_retries = match rp.num_retries.as_ref().map(|v| v.value) {
+            Some(0) => {
+                return Err(Error::Validation(
+                    "retry_policy.num_retries must be >= 1".into(),
+                ));
+            }
+            other => other,
+        };
+
         let (base_interval, max_interval) = match rp.retry_back_off.as_ref() {
-            Some(backoff) => (
-                backoff.base_interval.as_ref().and_then(proto_duration),
-                backoff.max_interval.as_ref().and_then(proto_duration),
-            ),
+            Some(backoff) => {
+                let base_interval = backoff
+                    .base_interval
+                    .as_ref()
+                    .and_then(proto_duration)
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        Error::Validation(
+                            "retry_policy.retry_back_off.base_interval must be greater than 0"
+                                .into(),
+                        )
+                    })?;
+                let max_interval = backoff
+                    .max_interval
+                    .as_ref()
+                    .map(|m| {
+                        proto_duration(m).filter(|d| !d.is_zero()).ok_or_else(|| {
+                            Error::Validation(
+                                "retry_policy.retry_back_off.max_interval must be greater than 0"
+                                    .into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                (Some(base_interval), max_interval)
+            }
             None => (None, None),
         };
-        Self {
+
+        Ok(Self {
             retry_on: rp.retry_on.clone(),
-            num_retries: rp.num_retries.as_ref().map(|v| v.value),
+            num_retries,
             base_interval,
             max_interval,
-        }
+        })
     }
 }
 
+/// Maximum `seconds` for a well-formed `google.protobuf.Duration`.
+const MAX_PROTO_DURATION_SECONDS: i64 = 315_576_000_000;
+
 /// Convert a protobuf `Duration` to [`std::time::Duration`], returning `None`
-/// for negative values (retry backoff intervals must be non-negative).
+/// for values outside the documented `google.protobuf.Duration` range
+/// (negatives included). Out-of-range values are rejected here so an invalid
+/// retry policy fails validation rather than overflowing later backoff math.
 fn proto_duration(d: &envoy_types::pb::google::protobuf::Duration) -> Option<Duration> {
+    if !(0..=MAX_PROTO_DURATION_SECONDS).contains(&d.seconds)
+        || !(0..=999_999_999).contains(&d.nanos)
+    {
+        return None;
+    }
     let seconds = u64::try_from(d.seconds).ok()?;
     let nanos = u32::try_from(d.nanos).ok()?;
     Some(Duration::new(seconds, nanos))
+}
+
+/// Parse and validate (gRFC A44) an Envoy `RetryPolicy` into a shared,
+/// resource-layer [`RouteRetryConfig`]. Routes that inherit a virtual host's
+/// policy share one `Arc`.
+fn parse_retry(rp: &RetryPolicy) -> xds_client::Result<Arc<RouteRetryConfig>> {
+    Ok(Arc::new(RouteRetryConfig::from_proto(rp)?))
 }
 
 /// Validated virtual host with domain matching and routes.
@@ -212,27 +258,12 @@ pub(crate) struct VirtualHostConfig {
 pub(crate) struct RouteConfig {
     pub match_criteria: RouteConfigMatch,
     pub action: RouteConfigAction,
-    /// This route's validated retry config, derived from its
-    /// `RouteAction.retry_policy` (RDS) when the `RouteConfiguration` is
-    /// validated, falling back to the enclosing `VirtualHost.retry_policy` when
-    /// the route sets none. `None` when neither specifies retry.
-    ///
-    /// Per gRFC A44 a route-level policy completely overrides the virtual host's
-    /// (values are not merged); routes that inherit the vhost policy share its
-    /// `Arc`.
-    ///
-    /// The `retry_on` conditions are parsed into gRPC status codes and defaults
-    /// applied **here, once at validation time** — not per request — so the hot
-    /// path never parses. Held behind an `Arc` so the routing layer can hand the
-    /// matched route's shared config to the retry layer (via `RouteDecision`) by
-    /// a cheap pointer clone, and the retry layer instantiates a per-request
-    /// policy from it with no allocation (see `GrpcRetrySharedConfig`).
-    ///
-    /// Per-route granularity: each request retries according to the exact route
-    /// it matched (gRFC A44). This holds a gRPC-specific config (rather than the
-    /// transport-neutral `RouteRetryConfig`) because deriving and validating it
-    /// once at RDS-validation time is what keeps the request path allocation-free.
-    pub retry_config: Option<Arc<GrpcRetrySharedConfig>>,
+    /// Validated retry settings for this route (gRFC A44), or `None` when
+    /// neither the route nor its virtual host sets a policy. A route-level
+    /// policy completely overrides the virtual host's (values are not merged);
+    /// routes that inherit the vhost policy share one `Arc`. The routing layer
+    /// compiles this into the gRPC retry config once per RDS update.
+    pub retry_config: Option<Arc<RouteRetryConfig>>,
 }
 
 /// Validated route match criteria.
@@ -336,15 +367,9 @@ impl Resource for RouteConfigResource {
             }
 
             let mut routes = Vec::with_capacity(vh.routes.len());
-            // gRFC A44: a `VirtualHost.retry_policy` applies to every route in the
-            // vhost that doesn't set its own; a route-level policy completely
-            // overrides it (values are not merged). Parse it once per vhost so all
-            // inheriting routes share the same `Arc`.
-            let vh_retry = vh.retry_policy.as_ref().map(|rp| {
-                Arc::new(GrpcRetrySharedConfig::from_route_retry(
-                    &RouteRetryConfig::from_proto(rp),
-                ))
-            });
+            // gRFC A44: routes inherit the virtual host's retry policy unless they
+            // set their own. Parse it once so inheriting routes share one `Arc`.
+            let vh_retry = vh.retry_policy.as_ref().map(parse_retry).transpose()?;
             for route in vh.routes {
                 if let Some(validated_route) = validate_route(route, vh_retry.as_ref())? {
                     routes.push(validated_route);
@@ -369,12 +394,11 @@ impl Resource for RouteConfigResource {
 /// Returns `Ok(None)` for routes that should be silently skipped (query param matchers,
 /// unsupported cluster specifiers like `cluster_header`).
 ///
-/// `vh_retry` is the enclosing virtual host's retry config (gRFC A44), if any. It is
-/// used as the fallback for routes that don't set their own `RouteAction.retry_policy`;
-/// a route-level policy takes precedence and completely overrides it.
+/// `vh_retry` is the virtual host's retry config (gRFC A44), used as the fallback
+/// when the route sets no `RouteAction.retry_policy` of its own.
 fn validate_route(
     route: envoy_types::pb::envoy::config::route::v3::Route,
-    vh_retry: Option<&Arc<GrpcRetrySharedConfig>>,
+    vh_retry: Option<&Arc<RouteRetryConfig>>,
 ) -> xds_client::Result<Option<RouteConfig>> {
     let route_match = route
         .r#match
@@ -392,23 +416,19 @@ fn validate_route(
         .ok_or_else(|| Error::Validation("route missing action field".into()))?;
 
     let validated_action;
-    let retry_config;
+    let route_retry;
     match action {
-        route::Action::Route(route_action) => {
-            // Parse and validate the route's retry policy before `route_action`
-            // is consumed. Deriving the gRPC config here — once, at RDS-validation
-            // time — is what keeps the request hot path free of parsing and
-            // allocation (see `RouteConfig::retry_config`). A route-level policy
-            // takes precedence over the virtual host's (gRFC A44); the vhost
-            // fallback is applied below.
-            retry_config = route_action.retry_policy.as_ref().map(|rp| {
-                let raw = RouteRetryConfig::from_proto(rp);
-                Arc::new(GrpcRetrySharedConfig::from_route_retry(&raw))
-            });
+        route::Action::Route(mut route_action) => {
+            // Take the retry policy before `route_action` is consumed, but parse
+            // it only once the route is known to be kept, so dropped routes cost
+            // no retry parsing (gRFC A44: a route-level policy overrides the
+            // virtual host's).
+            let retry_policy = route_action.retry_policy.take();
             match validate_route_action(route_action)? {
                 Some(action) => validated_action = action,
                 None => return Ok(None),
             }
+            route_retry = retry_policy.as_ref().map(parse_retry).transpose()?;
         }
         // Per A28: action field must be "route", otherwise NACK.
         _ => {
@@ -421,11 +441,8 @@ fn validate_route(
     Ok(Some(RouteConfig {
         match_criteria,
         action: validated_action,
-        // gRFC A44: fall back to the virtual host's retry policy when the route
-        // has none. `retry_config` is `Some` iff the route set its own policy, so
-        // `or_else` implements route-over-vhost precedence (a complete override,
-        // not a field merge). Inheriting routes share the vhost's `Arc`.
-        retry_config: retry_config.or_else(|| vh_retry.cloned()),
+        // gRFC A44: route-level policy wins; otherwise inherit the vhost's.
+        retry_config: route_retry.or_else(|| vh_retry.cloned()),
     }))
 }
 
@@ -602,9 +619,10 @@ impl RouteConfigResource {
 mod tests {
     use super::*;
     use envoy_types::pb::envoy::config::route::v3::{
-        RetryPolicy, RouteAction, VirtualHost, route::Action, route_action::ClusterSpecifier,
+        RetryPolicy, RouteAction, VirtualHost, retry_policy::RetryBackOff, route::Action,
+        route_action::ClusterSpecifier,
     };
-    use envoy_types::pb::google::protobuf::UInt32Value;
+    use envoy_types::pb::google::protobuf::{Duration as ProtoDuration, UInt32Value};
 
     fn make_route(prefix: &str, cluster: &str) -> envoy_types::pb::envoy::config::route::v3::Route {
         envoy_types::pb::envoy::config::route::v3::Route {
@@ -645,6 +663,38 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    fn proto_dur(seconds: i64, nanos: i32) -> ProtoDuration {
+        ProtoDuration { seconds, nanos }
+    }
+
+    fn retry_policy_with_backoff(
+        base: Option<ProtoDuration>,
+        max: Option<ProtoDuration>,
+    ) -> RetryPolicy {
+        RetryPolicy {
+            retry_on: "unavailable".to_string(),
+            retry_back_off: Some(RetryBackOff {
+                base_interval: base,
+                max_interval: max,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn validate_with_route_retry(retry: RetryPolicy) -> xds_client::Result<RouteConfigResource> {
+        let rc = RouteConfiguration {
+            name: "rc".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vh1".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![make_route_with_retry("/", "c1", retry)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        RouteConfigResource::validate(rc)
     }
 
     fn make_route_config(name: &str) -> RouteConfiguration {
@@ -1159,5 +1209,73 @@ mod tests {
         };
         let validated = RouteConfigResource::validate(rc).unwrap();
         assert!(validated.virtual_hosts[0].routes[0].retry_config.is_none());
+    }
+
+    // gRFC A44: the resource must be NACKed (validation error) when num_retries < 1
+    // or a set base_interval/max_interval is not greater than zero.
+
+    #[test]
+    fn test_retry_num_retries_zero_is_rejected() {
+        let err = validate_with_route_retry(retry_policy("unavailable", 0)).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn test_retry_base_interval_zero_is_rejected() {
+        let policy = retry_policy_with_backoff(Some(proto_dur(0, 0)), None);
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_base_interval_negative_is_rejected() {
+        let policy = retry_policy_with_backoff(Some(proto_dur(-1, 0)), None);
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_back_off_without_base_interval_is_rejected() {
+        // retry_back_off set but base_interval unset => base is 0 => rejected.
+        let policy = retry_policy_with_backoff(None, Some(proto_dur(1, 0)));
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_max_interval_zero_is_rejected() {
+        let policy =
+            retry_policy_with_backoff(Some(proto_dur(0, 100_000_000)), Some(proto_dur(0, 0)));
+        assert!(validate_with_route_retry(policy).is_err());
+    }
+
+    #[test]
+    fn test_retry_base_interval_below_1ms_is_accepted() {
+        // A44: values < 1ms are treated as 1ms (clamped), not rejected.
+        let policy = retry_policy_with_backoff(Some(proto_dur(0, 500_000)), None);
+        assert!(validate_with_route_retry(policy).is_ok());
+    }
+
+    #[test]
+    fn test_retry_valid_backoff_is_accepted() {
+        let mut policy =
+            retry_policy_with_backoff(Some(proto_dur(0, 100_000_000)), Some(proto_dur(1, 0)));
+        policy.num_retries = Some(UInt32Value { value: 2 });
+        let validated = validate_with_route_retry(policy).expect("valid retry policy");
+        assert!(validated.virtual_hosts[0].routes[0].retry_config.is_some());
+    }
+
+    #[test]
+    fn test_vhost_retry_invalid_is_rejected() {
+        // A virtual-host-level policy is validated the same way and NACKs on error.
+        let rc = RouteConfiguration {
+            name: "rc".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vh1".to_string(),
+                domains: vec!["*".to_string()],
+                retry_policy: Some(retry_policy("unavailable", 0)),
+                routes: vec![make_route("/", "c1")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(RouteConfigResource::validate(rc).is_err());
     }
 }

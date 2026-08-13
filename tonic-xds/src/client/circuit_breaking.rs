@@ -997,7 +997,7 @@ mod tests {
             },
         );
         let mut service = tower::ServiceBuilder::new()
-            .layer(RetryLayer::new(policy))
+            .layer(RetryLayer::new(policy.into_shared()))
             .layer(CircuitBreakingLayer::new(breakers.clone()))
             .service(service);
 

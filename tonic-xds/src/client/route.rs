@@ -24,9 +24,13 @@
 
 use crate::client::retry::GrpcRetrySharedConfig;
 use crate::common::async_util::BoxFuture;
-use crate::xds::resource::route_config::{RouteConfigMetadata, RouteConfigResource};
+use crate::xds::resource::route_config::{
+    RouteConfigMetadata, RouteConfigResource, RouteRetryConfig,
+};
 use crate::xds::routing::RoutingError;
 use http::Request;
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{BoxError, Layer, Service};
@@ -51,13 +55,12 @@ pub(crate) struct RouteDecision {
     // Populated by the routing layer; consumed by the ring-hash picker (later PR).
     #[allow(dead_code)]
     pub request_hash: Option<u64>,
-    /// The matched route's shared retry config (RDS `RouteAction.retry_policy`),
-    /// or `None` when the route specifies no retry. Carried from the same config
-    /// snapshot the routing decision was made on, so the retry layer applies the
-    /// config for exactly the route this request took (gRFC A44). Already parsed
-    /// and validated at RDS-validation time and held behind an `Arc`, so the
-    /// retry layer instantiates a per-request policy from it with a pointer clone
-    /// (see `GrpcRetrySharedConfig`).
+    /// The matched route's compiled retry config (RDS `RouteAction.retry_policy`),
+    /// or `None` when the route specifies no retry. Resolved from the same
+    /// [`RoutingSnapshot`] the routing decision was made on, so the retry layer
+    /// applies the config for exactly the route this request took (gRFC A44).
+    /// Compiled once per RDS update and held behind an `Arc`, so the retry layer
+    /// instantiates a per-request policy from it with a pointer clone.
     pub retry_config: Option<Arc<GrpcRetrySharedConfig>>,
 }
 
@@ -73,6 +76,62 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
+/// A per-RDS-update routing snapshot: the validated [`RouteConfigResource`]
+/// bundled with the gRPC retry configs compiled from it, once, when the snapshot
+/// is installed.
+///
+/// Holding both in one `Arc` lets the routing layer resolve a route and its
+/// retry config from a single, consistent RDS version, and keeps the request hot
+/// path to a map lookup plus an `Arc` clone (no parsing or allocation).
+///
+/// Compiling the gRPC config here, rather than in the xDS resource layer, keeps
+/// the resource types free of gRPC business logic.
+#[derive(Debug, Default)]
+pub(crate) struct RoutingSnapshot {
+    resource: Arc<RouteConfigResource>,
+    /// Compiled retry config per route, keyed by the address of the route's
+    /// [`RouteRetryConfig`] `Arc`. Routes that share one config (vhost
+    /// inheritance) resolve to a single entry; routes whose `retry_on` maps to no
+    /// gRPC code have no entry (gRFC A44).
+    retry: HashMap<usize, Arc<GrpcRetrySharedConfig>>,
+}
+
+impl RoutingSnapshot {
+    /// Builds a snapshot from a validated resource, compiling each distinct
+    /// route retry config once (gRFC A44).
+    pub(crate) fn new(resource: Arc<RouteConfigResource>) -> Self {
+        let mut retry: HashMap<usize, Arc<GrpcRetrySharedConfig>> = HashMap::new();
+        for vhost in &resource.virtual_hosts {
+            for route in &vhost.routes {
+                if let Some(config) = &route.retry_config {
+                    let key = Arc::as_ptr(config) as usize;
+                    if let std::collections::hash_map::Entry::Vacant(entry) = retry.entry(key)
+                        && let Some(shared) = GrpcRetrySharedConfig::from_route_retry(config)
+                    {
+                        entry.insert(Arc::new(shared));
+                    }
+                }
+            }
+        }
+        Self { resource, retry }
+    }
+
+    /// The compiled gRPC retry config for a route's [`RouteRetryConfig`], if any.
+    pub(crate) fn retry_for(
+        &self,
+        config: Option<&Arc<RouteRetryConfig>>,
+    ) -> Option<Arc<GrpcRetrySharedConfig>> {
+        config.and_then(|config| self.retry.get(&(Arc::as_ptr(config) as usize)).cloned())
+    }
+}
+
+impl Deref for RoutingSnapshot {
+    type Target = RouteConfigResource;
+    fn deref(&self) -> &Self::Target {
+        &self.resource
+    }
+}
+
 /// A route config obtained in one step, to serve a single request with.
 ///
 /// Two cases so the common one -- a config is already in effect -- costs
@@ -80,15 +139,15 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
 /// wait for the first config.
 pub(crate) enum AcquiredConfig {
     /// A config is already in effect.
-    Ready(Arc<RouteConfigResource>),
+    Ready(Arc<RoutingSnapshot>),
     /// None has arrived yet; await this for the first one, bounded by an
     /// implementation-defined timeout.
-    Pending(BoxFuture<Result<Arc<RouteConfigResource>, RoutingError>>),
+    Pending(BoxFuture<Result<Arc<RoutingSnapshot>, RoutingError>>),
 }
 
 impl AcquiredConfig {
     /// Resolves to the config, awaiting only when one is not already available.
-    pub(crate) async fn get(self) -> Result<Arc<RouteConfigResource>, RoutingError> {
+    pub(crate) async fn get(self) -> Result<Arc<RoutingSnapshot>, RoutingError> {
         match self {
             Self::Ready(config) => Ok(config),
             Self::Pending(wait) => wait.await,
@@ -109,7 +168,7 @@ pub(crate) trait Router: Send + Sync + 'static {
     fn route(
         &self,
         input: &RouteInput<'_>,
-        config: &RouteConfigResource,
+        config: &RoutingSnapshot,
     ) -> Result<RouteDecision, RoutingError>;
 }
 
@@ -224,13 +283,13 @@ mod tests {
 
     impl Router for CaptureAuthorityRouter {
         fn acquire(&self) -> AcquiredConfig {
-            AcquiredConfig::Ready(Arc::new(RouteConfigResource::default()))
+            AcquiredConfig::Ready(Arc::new(RoutingSnapshot::default()))
         }
 
         fn route(
             &self,
             input: &RouteInput<'_>,
-            _config: &RouteConfigResource,
+            _config: &RoutingSnapshot,
         ) -> Result<RouteDecision, RoutingError> {
             *self.captured.lock().unwrap() = Some(input.authority.to_string());
             Ok(RouteDecision {
@@ -333,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn releases_the_route_config_before_calling_the_inner_service() {
         struct SharedConfigRouter {
-            config: Arc<RouteConfigResource>,
+            config: Arc<RoutingSnapshot>,
         }
 
         impl Router for SharedConfigRouter {
@@ -344,7 +403,7 @@ mod tests {
             fn route(
                 &self,
                 _input: &RouteInput<'_>,
-                _config: &RouteConfigResource,
+                _config: &RoutingSnapshot,
             ) -> Result<RouteDecision, RoutingError> {
                 Ok(RouteDecision {
                     cluster: "c".to_string(),
@@ -354,7 +413,7 @@ mod tests {
             }
         }
 
-        let config = Arc::new(RouteConfigResource::default());
+        let config = Arc::new(RoutingSnapshot::default());
         let router: Arc<dyn Router> = Arc::new(SharedConfigRouter {
             config: config.clone(),
         });

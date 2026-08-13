@@ -46,7 +46,9 @@ use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
 
-use crate::client::retry::{GrpcRetryPolicy, RetryLayer};
+#[cfg(test)]
+use crate::client::retry::GrpcRetryPolicy;
+use crate::client::retry::{GrpcRetrySharedConfig, RetryLayer};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -368,16 +370,14 @@ impl XdsChannelBuilder {
     ) -> XdsChannelGrpc {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
 
-        // Retry config is control-plane-driven from RDS, per route. It is parsed
-        // and validated once, when the `RouteConfiguration` is validated. The
-        // routing layer (outer) stamps the matched route's shared retry config
-        // into the request's `RouteDecision`; the retry layer reads the shared
-        // config `Arc` and instantiates a per-request policy from it, so the
-        // request hot path does no parsing or allocation. The default below is
-        // the fallback used when a request carries no route retry config (non-xDS
-        // callers, or a route with no retry policy). See
-        // [`RetryLayer`](crate::client::retry::RetryLayer).
-        let retry_layer = RetryLayer::new(GrpcRetryPolicy::default());
+        // Retry config is control-plane-driven from RDS, per route, compiled once
+        // per RDS update in the routing layer and carried on the request's
+        // `RouteDecision`; the retry layer reads that shared config `Arc` and
+        // instantiates a per-request policy from it, so the request hot path does
+        // no parsing or allocation. The default below is the fallback used when a
+        // request carries no route retry config (non-xDS callers, or a route with
+        // no retry policy). See [`RetryLayer`](crate::client::retry::RetryLayer).
+        let retry_layer = RetryLayer::new(Arc::new(GrpcRetrySharedConfig::default()));
 
         #[cfg(feature = "_tls-any")]
         let discovery: Arc<
@@ -432,7 +432,7 @@ impl XdsChannelBuilder {
         interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
         let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
-        let retry_layer = RetryLayer::new(retry_policy);
+        let retry_layer = RetryLayer::new(retry_policy.into_shared());
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
@@ -532,7 +532,7 @@ mod tests {
         fn route(
             &self,
             _input: &RouteInput<'_>,
-            _config: &crate::xds::resource::route_config::RouteConfigResource,
+            _config: &crate::client::route::RoutingSnapshot,
         ) -> Result<RouteDecision, crate::xds::routing::RoutingError> {
             Ok(RouteDecision {
                 cluster: "test-cluster".to_string(),
