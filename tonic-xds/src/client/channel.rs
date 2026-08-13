@@ -46,8 +46,6 @@ use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
 
-#[cfg(test)]
-use crate::client::retry::GrpcRetryPolicy;
 use crate::client::retry::{GrpcRetrySharedConfig, RetryLayer};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
@@ -418,17 +416,17 @@ impl XdsChannelBuilder {
     }
 
     /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
-    /// policy, and optional pre-route interceptor.
+    /// config, and optional pre-route interceptor.
     #[cfg(test)]
     pub(crate) fn build_grpc_channel_from_parts(
         &self,
         router: Arc<dyn Router>,
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
-        retry_policy: GrpcRetryPolicy,
+        retry: Arc<GrpcRetrySharedConfig>,
         interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
         let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
-        let retry_layer = RetryLayer::new(retry_policy.into_shared());
+        let retry_layer = RetryLayer::new(retry);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
@@ -464,7 +462,7 @@ mod tests {
         XdsChannelConfig::new(XdsUri::parse("xds:///test-service").unwrap())
     }
     use crate::client::lb::{BoxDiscover, ClusterDiscovery};
-    use crate::client::retry::GrpcRetryPolicy;
+    use crate::client::retry::GrpcRetrySharedConfig;
     use crate::client::route::RouteDecision;
     use crate::client::route::RouteInput;
     use crate::client::route::Router;
@@ -616,7 +614,7 @@ mod tests {
         let xds_channel = xds_channel_builder.build_grpc_channel_from_parts(
             xds_manager.clone(),
             xds_manager.clone(),
-            GrpcRetryPolicy::default(),
+            Arc::new(GrpcRetrySharedConfig::default()),
             None,
         );
 
@@ -674,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_once_on_unavailable() {
-        use crate::client::retry::{GrpcRetryClassifier, GrpcRetryPolicy, RetryConfig};
+        use crate::client::retry::{GrpcRetryClassifier, RetryConfig};
         use crate::testutil::grpc::spawn_fail_first_n_server;
 
         // Server fails the first request with UNAVAILABLE, succeeds on retry.
@@ -685,15 +683,15 @@ mod tests {
         let servers = vec![server];
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
-        let retry_policy = GrpcRetryPolicy::new(
+        let retry = Arc::new(GrpcRetrySharedConfig::new(
             RetryConfig::new().num_retries(1),
             GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]),
-        );
+        ));
 
         let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(
             xds_manager.clone(),
             xds_manager.clone(),
-            retry_policy,
+            retry,
             None,
         );
 
@@ -796,7 +794,12 @@ mod tests {
         > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
 
         let builder = XdsChannelBuilder::new(test_config());
-        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default(), None)
+        builder.build_grpc_channel_from_parts(
+            router,
+            discovery,
+            Arc::new(GrpcRetrySharedConfig::default()),
+            None,
+        )
     }
 
     /// Tests the full xDS stack (XdsRouter + XdsClusterDiscovery) with a
