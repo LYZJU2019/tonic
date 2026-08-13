@@ -56,11 +56,9 @@ pub(crate) struct RouteDecision {
     #[allow(dead_code)]
     pub request_hash: Option<u64>,
     /// The matched route's compiled retry config (RDS `RouteAction.retry_policy`),
-    /// or `None` when the route specifies no retry. Resolved from the same
-    /// [`RoutingSnapshot`] the routing decision was made on, so the retry layer
-    /// applies the config for exactly the route this request took (gRFC A44).
-    /// Compiled once per RDS update and held behind an `Arc`, so the retry layer
-    /// instantiates a per-request policy from it with a pointer clone.
+    /// or `None` when the route sets no retry. Resolved from the [`RoutingSnapshot`]
+    /// this decision was made on, so the retry layer applies the config for exactly
+    /// the route the request took.
     pub retry_config: Option<Arc<GrpcRetrySharedConfig>>,
 }
 
@@ -76,29 +74,24 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
-/// A per-RDS-update routing snapshot: the validated [`RouteConfigResource`]
-/// bundled with the gRPC retry configs compiled from it, once, when the snapshot
-/// is installed.
+/// The validated [`RouteConfigResource`] bundled with the gRPC retry configs
+/// compiled from it, one per RDS update.
 ///
-/// Holding both in one `Arc` lets the routing layer resolve a route and its
-/// retry config from a single, consistent RDS version, and keeps the request hot
-/// path to a map lookup plus an `Arc` clone (no parsing or allocation).
-///
-/// Compiling the gRPC config here, rather than in the xDS resource layer, keeps
-/// the resource types free of gRPC business logic.
+/// Bundling both behind one `Arc` lets routing resolve a route and its retry
+/// config from a single consistent RDS version, and keeps the request path to a
+/// map lookup plus a pointer clone. Compiling here, rather than in the xDS
+/// resource layer, keeps the resource types free of gRPC types.
 #[derive(Debug, Default)]
 pub(crate) struct RoutingSnapshot {
     resource: Arc<RouteConfigResource>,
-    /// Compiled retry config per route, keyed by the address of the route's
-    /// [`RouteRetryConfig`] `Arc`. Routes that share one config (vhost
-    /// inheritance) resolve to a single entry; routes whose `retry_on` maps to no
-    /// gRPC code have no entry (gRFC A44).
+    /// Compiled retry config, keyed by the identity (`Arc` address) of the
+    /// route's [`RouteRetryConfig`]. Routes that inherit a vhost policy share one
+    /// entry; a route whose `retry_on` maps to no gRPC code has none.
     retry: HashMap<usize, Arc<GrpcRetrySharedConfig>>,
 }
 
 impl RoutingSnapshot {
-    /// Builds a snapshot from a validated resource, compiling each distinct
-    /// route retry config once (gRFC A44).
+    /// Compiles each distinct route retry config once.
     pub(crate) fn new(resource: Arc<RouteConfigResource>) -> Self {
         let mut retry: HashMap<usize, Arc<GrpcRetrySharedConfig>> = HashMap::new();
         for vhost in &resource.virtual_hosts {

@@ -370,13 +370,9 @@ impl XdsChannelBuilder {
     ) -> XdsChannelGrpc {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
 
-        // Retry config is control-plane-driven from RDS, per route, compiled once
-        // per RDS update in the routing layer and carried on the request's
-        // `RouteDecision`; the retry layer reads that shared config `Arc` and
-        // instantiates a per-request policy from it, so the request hot path does
-        // no parsing or allocation. The default below is the fallback used when a
-        // request carries no route retry config (non-xDS callers, or a route with
-        // no retry policy). See [`RetryLayer`](crate::client::retry::RetryLayer).
+        // Fallback retry config for requests that carry no per-route config
+        // (non-xDS callers, or a route with no retry policy). Per-route configs
+        // come from RDS via the request's `RouteDecision`; see `RetryLayer`.
         let retry_layer = RetryLayer::new(Arc::new(GrpcRetrySharedConfig::default()));
 
         #[cfg(feature = "_tls-any")]

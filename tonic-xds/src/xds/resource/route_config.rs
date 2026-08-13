@@ -152,8 +152,7 @@ pub(crate) struct RouteConfigResource {
 }
 
 /// Validated Envoy retry settings (gRFC A44) parsed from a `RouteAction` or
-/// `VirtualHost` `retry_policy` (RDS). A resource-layer type; the routing layer
-/// compiles it into the gRPC retry config once per RDS update.
+/// `VirtualHost` `retry_policy`. A transport-neutral resource-layer type.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteRetryConfig {
     /// Envoy `retry_on` conditions, comma-separated (e.g. `"unavailable"`).
@@ -223,10 +222,9 @@ impl RouteRetryConfig {
 /// Maximum `seconds` for a well-formed `google.protobuf.Duration`.
 const MAX_PROTO_DURATION_SECONDS: i64 = 315_576_000_000;
 
-/// Convert a protobuf `Duration` to [`std::time::Duration`], returning `None`
-/// for values outside the documented `google.protobuf.Duration` range
-/// (negatives included). Out-of-range values are rejected here so an invalid
-/// retry policy fails validation rather than overflowing later backoff math.
+/// Convert a protobuf `Duration` to [`std::time::Duration`], returning `None` for
+/// values outside the documented `google.protobuf.Duration` range. Rejected here
+/// so an invalid retry policy fails validation rather than overflowing later.
 fn proto_duration(d: &envoy_types::pb::google::protobuf::Duration) -> Option<Duration> {
     if !(0..=MAX_PROTO_DURATION_SECONDS).contains(&d.seconds)
         || !(0..=999_999_999).contains(&d.nanos)
@@ -238,9 +236,7 @@ fn proto_duration(d: &envoy_types::pb::google::protobuf::Duration) -> Option<Dur
     Some(Duration::new(seconds, nanos))
 }
 
-/// Parse and validate (gRFC A44) an Envoy `RetryPolicy` into a shared,
-/// resource-layer [`RouteRetryConfig`]. Routes that inherit a virtual host's
-/// policy share one `Arc`.
+/// Parse and validate an Envoy `RetryPolicy` into a shared [`RouteRetryConfig`].
 fn parse_retry(rp: &RetryPolicy) -> xds_client::Result<Arc<RouteRetryConfig>> {
     Ok(Arc::new(RouteRetryConfig::from_proto(rp)?))
 }
@@ -258,11 +254,9 @@ pub(crate) struct VirtualHostConfig {
 pub(crate) struct RouteConfig {
     pub match_criteria: RouteConfigMatch,
     pub action: RouteConfigAction,
-    /// Validated retry settings for this route (gRFC A44), or `None` when
-    /// neither the route nor its virtual host sets a policy. A route-level
-    /// policy completely overrides the virtual host's (values are not merged);
-    /// routes that inherit the vhost policy share one `Arc`. The routing layer
-    /// compiles this into the gRPC retry config once per RDS update.
+    /// Validated retry settings (gRFC A44): the route's own `RouteAction.retry_policy`,
+    /// else the inherited `VirtualHost.retry_policy` (route-level fully overrides,
+    /// no merge), else `None`. Routes that inherit share one `Arc`.
     pub retry_config: Option<Arc<RouteRetryConfig>>,
 }
 
@@ -394,8 +388,7 @@ impl Resource for RouteConfigResource {
 /// Returns `Ok(None)` for routes that should be silently skipped (query param matchers,
 /// unsupported cluster specifiers like `cluster_header`).
 ///
-/// `vh_retry` is the virtual host's retry config (gRFC A44), used as the fallback
-/// when the route sets no `RouteAction.retry_policy` of its own.
+/// `vh_retry` is the virtual host's policy, inherited when the route sets none.
 fn validate_route(
     route: envoy_types::pb::envoy::config::route::v3::Route,
     vh_retry: Option<&Arc<RouteRetryConfig>>,
@@ -419,10 +412,8 @@ fn validate_route(
     let route_retry;
     match action {
         route::Action::Route(mut route_action) => {
-            // Take the retry policy before `route_action` is consumed, but parse
-            // it only once the route is known to be kept, so dropped routes cost
-            // no retry parsing (gRFC A44: a route-level policy overrides the
-            // virtual host's).
+            // Take the retry policy before `route_action` is consumed; parse it
+            // only if the route is kept, so dropped routes cost no parse.
             let retry_policy = route_action.retry_policy.take();
             match validate_route_action(route_action)? {
                 Some(action) => validated_action = action,
@@ -441,7 +432,6 @@ fn validate_route(
     Ok(Some(RouteConfig {
         match_criteria,
         action: validated_action,
-        // gRFC A44: route-level policy wins; otherwise inherit the vhost's.
         retry_config: route_retry.or_else(|| vh_retry.cloned()),
     }))
 }

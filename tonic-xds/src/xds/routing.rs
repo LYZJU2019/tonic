@@ -85,8 +85,6 @@ impl XdsRouter {
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
-                // Compile the retry configs once per RDS update, bundled with the
-                // resource so routing and retry read one consistent version.
                 rc.store(Some(Arc::new(RoutingSnapshot::new(config))));
                 // Signal readiness on the first config, then drop the sender.
                 if let Some(tx) = ready_tx.take() {
@@ -152,10 +150,8 @@ fn resolve_route(
             .to_string(),
     };
 
-    // Look up the matched route's compiled retry config (if any) from the same
-    // snapshot, so the retry layer applies the config for exactly the route this
-    // request took (gRFC A44). This is a map lookup plus a cheap `Arc` clone;
-    // routing and retry read one RDS version, so there is no cross-layer skew.
+    // Retry config for the matched route, from the same snapshot we routed on so
+    // retry and routing act on one RDS version.
     let retry_config = rc.retry_for(route.retry_config.as_ref());
 
     // gRFC A42 ring-hash request hash. The policy list is empty for now, so

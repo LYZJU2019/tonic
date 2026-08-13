@@ -314,8 +314,8 @@ impl<C> RetryPolicy<C> {
         Self::from_shared(Arc::new(RetrySharedConfig::new(config, classifier)))
     }
 
-    /// Instantiate per-request state from an already-shared config: an `Arc`
-    /// pointer clone plus a zero-field init. This is the hot path.
+    /// Instantiate per-request state from a shared config: a pointer clone plus
+    /// a zero-field init.
     pub(crate) fn from_shared(shared: Arc<RetrySharedConfig<C>>) -> Self {
         Self {
             shared,
@@ -324,8 +324,7 @@ impl<C> RetryPolicy<C> {
         }
     }
 
-    /// Consume the policy and return its shared config, discarding the
-    /// per-request state.
+    /// Consume the policy and return its shared config.
     pub(crate) fn into_shared(self) -> Arc<RetrySharedConfig<C>> {
         self.shared
     }
@@ -350,13 +349,11 @@ impl<C: Default> Default for RetryPolicy<C> {
 }
 
 impl RetrySharedConfig<GrpcRetryClassifier> {
-    /// Build a shared gRPC retry config from a route's [`RouteRetryConfig`] (RDS
-    /// `RouteAction.retry_policy`), parsing `retry_on` into [`tonic::Code`]s.
-    /// Unset Envoy fields fall back to [`RetryConfig`] defaults.
-    ///
-    /// Returns `None` when no `retry_on` condition maps to a gRPC status code
-    /// (gRFC A44): an empty set means "no retry policy" for the route, so it
-    /// falls back to the layer default rather than masking connection retries.
+    /// Build a shared gRPC config from a route's [`RouteRetryConfig`], mapping
+    /// `retry_on` to [`tonic::Code`]s; unset Envoy fields use [`RetryConfig`]
+    /// defaults. Returns `None` when no condition maps to a gRPC code, so the
+    /// route falls back to the layer default instead of masking connection
+    /// retries (gRFC A44).
     pub(crate) fn from_route_retry(retry: &RouteRetryConfig) -> Option<Self> {
         let retry_on = grpc_retry_on_codes(&retry.retry_on);
         if retry_on.is_empty() {
@@ -443,16 +440,10 @@ pub(crate) type GrpcRetrySharedConfig = RetrySharedConfig<GrpcRetryClassifier>;
 
 /// Tower [`Layer`] that wraps a gRPC service with retry support.
 ///
-/// Converts the request body into a cloneable [`SharedBody`] and builds a fresh
-/// [`tower::retry::Retry`] per request. The retry config is selected per request
-/// from the route the request matched: the routing layer (just outside this one)
-/// stamps the matched route's shared config into the request's [`RouteDecision`].
-/// Requests with no [`RouteDecision`] (non-xDS callers) or whose matched route
+/// Builds a fresh [`tower::retry::Retry`] per request, selecting the config from
+/// the matched route's [`RouteDecision`] (stamped by the routing layer just
+/// outside). Requests with no [`RouteDecision`] (non-xDS callers) or whose route
 /// carries no retry policy use `fallback`.
-///
-/// gRPC-specific because it reads the concrete [`RouteDecision`] extension; the
-/// retry engine ([`RetryPolicy`], [`RetrySharedConfig`], [`RetryClassifier`])
-/// stays transport-agnostic.
 #[derive(Clone)]
 pub(crate) struct RetryLayer {
     /// Config used when a request carries no per-route retry config.
@@ -460,8 +451,7 @@ pub(crate) struct RetryLayer {
 }
 
 impl RetryLayer {
-    /// Create a layer with the given `fallback` shared config, used when a
-    /// request carries no per-route retry config (see [`RetryLayer`]).
+    /// Create a layer with the given `fallback` config.
     pub(crate) fn new(fallback: Arc<GrpcRetrySharedConfig>) -> Self {
         Self { fallback }
     }
@@ -512,8 +502,7 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        // Use the shared config the routing layer stamped into the RouteDecision
-        // for the route this request matched, falling back when it carries none.
+        // Config the routing layer stamped for this request's route, or the fallback.
         let shared = request
             .extensions()
             .get::<RouteDecision>()
