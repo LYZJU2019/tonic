@@ -174,6 +174,10 @@ pub use client::channel::{
 pub use client::endpoint::{
     ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
 };
+pub use client::retry::{
+    GrpcRetryClassifierFactory, RetryClassifier, RetryClassifierFactory, RetryOutcome,
+    is_retryable_connection_error,
+};
 pub use client::route::PreRouteInterceptor;
 pub use common::async_util::BoxFuture;
 pub use xds::bootstrap::{BootstrapConfig, BootstrapError};

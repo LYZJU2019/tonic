@@ -46,7 +46,7 @@ use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
 
-use crate::client::retry::{GrpcRetrySharedConfig, RetryLayer};
+use crate::client::retry::{RetryClassifierFactory, RetryLayer, RetrySharedConfig};
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
 #[derive(Clone, Debug)]
@@ -195,6 +195,7 @@ pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
     recorder: Option<Arc<dyn MetricsRecorder>>,
     pre_route: Option<Arc<dyn PreRouteInterceptor>>,
+    retry_classifier_factory: Option<Arc<dyn RetryClassifierFactory>>,
     #[cfg(feature = "_tls-any")]
     cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
@@ -216,6 +217,13 @@ impl Debug for XdsChannelBuilder {
                     .pre_route
                     .as_deref()
                     .map_or("None", |i| std::any::type_name_of_val(i)),
+            )
+            .field(
+                "retry_classifier_factory",
+                &self
+                    .retry_classifier_factory
+                    .as_deref()
+                    .map_or("None", |f| std::any::type_name_of_val(f)),
             );
         #[cfg(feature = "_tls-any")]
         s.field(
@@ -234,6 +242,7 @@ impl XdsChannelBuilder {
             config: Arc::new(config),
             recorder: None,
             pre_route: None,
+            retry_classifier_factory: None,
             #[cfg(feature = "_tls-any")]
             cert_providers: HashMap::new(),
         }
@@ -263,6 +272,22 @@ impl XdsChannelBuilder {
     #[must_use]
     pub fn with_pre_route_interceptor(mut self, interceptor: Arc<dyn PreRouteInterceptor>) -> Self {
         self.pre_route = Some(interceptor);
+        self
+    }
+
+    /// Overrides the [`RetryClassifierFactory`] used to compile per-route retry
+    /// policies from RDS. By default (`None`) the gRPC
+    /// [`GrpcRetryClassifierFactory`](crate::GrpcRetryClassifierFactory) is used.
+    ///
+    /// A non-gRPC transport supplies its own factory so a route's Envoy
+    /// `retry_on` conditions are interpreted for that transport and produce the
+    /// matching [`RetryClassifier`](crate::RetryClassifier).
+    #[must_use]
+    pub fn with_retry_classifier_factory(
+        mut self,
+        factory: Arc<dyn RetryClassifierFactory>,
+    ) -> Self {
+        self.retry_classifier_factory = Some(factory);
         self
     }
 
@@ -366,12 +391,15 @@ impl XdsChannelBuilder {
         xds_client: XdsClient,
         resource_manager: XdsResourceManager,
     ) -> XdsChannelGrpc {
-        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
+        let router: Arc<dyn Router> = Arc::new(match self.retry_classifier_factory.clone() {
+            Some(factory) => XdsRouter::with_retry_factory(&cache, factory),
+            None => XdsRouter::new(&cache),
+        });
 
         // Fallback retry config for requests that carry no per-route config
         // (non-xDS callers, or a route with no retry policy). Per-route configs
         // come from RDS via the request's `RouteDecision`; see `RetryLayer`.
-        let retry_layer = RetryLayer::new(Arc::new(GrpcRetrySharedConfig::default()));
+        let retry_layer = RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default()));
 
         #[cfg(feature = "_tls-any")]
         let discovery: Arc<
@@ -422,7 +450,7 @@ impl XdsChannelBuilder {
         &self,
         router: Arc<dyn Router>,
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
-        retry: Arc<GrpcRetrySharedConfig>,
+        retry: Arc<RetrySharedConfig>,
         interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
         let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
@@ -462,7 +490,7 @@ mod tests {
         XdsChannelConfig::new(XdsUri::parse("xds:///test-service").unwrap())
     }
     use crate::client::lb::{BoxDiscover, ClusterDiscovery};
-    use crate::client::retry::GrpcRetrySharedConfig;
+    use crate::client::retry::RetrySharedConfig;
     use crate::client::route::RouteDecision;
     use crate::client::route::RouteInput;
     use crate::client::route::Router;
@@ -614,7 +642,7 @@ mod tests {
         let xds_channel = xds_channel_builder.build_grpc_channel_from_parts(
             xds_manager.clone(),
             xds_manager.clone(),
-            Arc::new(GrpcRetrySharedConfig::default()),
+            Arc::new(RetrySharedConfig::grpc_default()),
             None,
         );
 
@@ -683,9 +711,9 @@ mod tests {
         let servers = vec![server];
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
-        let retry = Arc::new(GrpcRetrySharedConfig::new(
+        let retry = Arc::new(RetrySharedConfig::new(
             RetryConfig::new().num_retries(1),
-            GrpcRetryClassifier::new(vec![tonic::Code::Unavailable]),
+            Arc::new(GrpcRetryClassifier::new(vec![tonic::Code::Unavailable])),
         ));
 
         let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(
@@ -797,7 +825,7 @@ mod tests {
         builder.build_grpc_channel_from_parts(
             router,
             discovery,
-            Arc::new(GrpcRetrySharedConfig::default()),
+            Arc::new(RetrySharedConfig::grpc_default()),
             None,
         )
     }
