@@ -114,7 +114,7 @@ allowed_external_types = [
     # not major released
     "prost::*",
     "opentelemetry::*",
-    "shared_http_body::SharedBody",
+    "shared_http_body::shared_body::SharedBody",
 
     "tower_service::Service",
     "tower::BoxError",
