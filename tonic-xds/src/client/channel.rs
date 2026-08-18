@@ -22,8 +22,10 @@
  *
  */
 
-use crate::client::cluster::ClusterClientRegistryGrpc;
-use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+use crate::client::cluster::ClusterClientRegistry;
+use crate::client::endpoint::{EndpointAddress, MakeConnector};
+#[cfg(test)]
+use crate::client::endpoint::EndpointChannel;
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
@@ -34,14 +36,18 @@ use crate::xds::cluster_discovery::{GrpcMakeConnector, XdsClusterDiscovery};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use crate::{TonicCallCredentials, XdsUri};
-use http::Request;
+use http::{Request, Response};
+use http_body::Body;
+use shared_http_body::SharedBody;
 #[cfg(feature = "_tls-any")]
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::{body::Body as TonicBody, client::GrpcService, transport::channel::Channel};
-use tower::{BoxError, Service, ServiceBuilder, util::BoxCloneSyncService};
+use tonic::{body::Body as TonicBody, client::GrpcService};
+#[cfg(test)]
+use tonic::transport::channel::Channel;
+use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
 };
@@ -123,6 +129,18 @@ struct XdsChannelResources {
     _xds_client: XdsClient,
 }
 
+/// xDS runtime built once from bootstrap (cache, ADS client, resource manager,
+/// and — under a TLS feature — the cert-provider registry), shared by
+/// [`XdsChannelBuilder::build_grpc_channel`] and
+/// [`XdsChannelBuilder::build_transport_channel`].
+struct XdsRuntimeParts {
+    cache: Arc<XdsCache>,
+    xds_client: XdsClient,
+    resource_manager: XdsResourceManager,
+    #[cfg(feature = "_tls-any")]
+    cert_provider_registry: Arc<CertProviderRegistry>,
+}
+
 /// `XdsChannel` is an xDS-capable [`tower::Service`] implementation.
 ///
 /// It routes requests according to the xDS configuration that it fetches from the xDS management server.
@@ -170,6 +188,19 @@ where
     }
 }
 
+/// A type-erased xDS channel over an arbitrary transport body pair.
+///
+/// Generalizes [`XdsChannelGrpc`] to any request/response body: the channel is
+/// a `Service<Request<B>, Response = Response<ResBody>>`. The routing, retry,
+/// and load-balancing stack is identical to the gRPC channel; only the endpoint
+/// transport differs. The body handed to the endpoint transport is the
+/// retry-buffered [`SharedBody<B>`] so failed attempts can be replayed.
+///
+/// `Send + Sync + Clone`; cloning is cheap (the inner stack is
+/// reference-counted).
+pub type XdsTransportChannel<B, ResBody> =
+    BoxCloneSyncService<Request<B>, Response<ResBody>, BoxError>;
+
 /// A [`tonic::client::GrpcService`] implementation that can route and load-balance
 /// gRPC requests based on xDS configuration.
 ///
@@ -177,8 +208,7 @@ where
 /// reference-counted); callers that need exclusive access for
 /// [`tower::Service::call`] should clone per call site rather than share a
 /// single instance through a lock.
-pub type XdsChannelGrpc =
-    BoxCloneSyncService<http::Request<TonicBody>, http::Response<TonicBody>, BoxError>;
+pub type XdsChannelGrpc = XdsTransportChannel<TonicBody, TonicBody>;
 
 // Static assertions: XdsChannelGrpc implements GrpcService and is shareable
 // across tasks (Send + Sync).
@@ -322,6 +352,14 @@ impl XdsChannelBuilder {
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
+        let parts = self.build_xds_parts()?;
+        Ok(self.build_grpc_channel_from_runtime(parts))
+    }
+
+    /// Builds the transport-agnostic xDS runtime (cache, ADS client, resource
+    /// manager, and — under a TLS feature — the cert-provider registry) from
+    /// bootstrap. Shared by the gRPC and transport-generic build entry points.
+    fn build_xds_parts(&self) -> Result<XdsRuntimeParts, BuildError> {
         let bootstrap = match self.config.bootstrap.clone() {
             Some(b) => b,
             None => BootstrapConfig::from_env()?,
@@ -371,29 +409,46 @@ impl XdsChannelBuilder {
         let resource_manager =
             XdsResourceManager::new(xds_client.clone(), cache.clone(), listener_name);
 
-        Ok(self.build_from_cache(
+        Ok(XdsRuntimeParts {
             cache,
-            #[cfg(feature = "_tls-any")]
-            cert_provider_registry,
             xds_client,
             resource_manager,
-        ))
+            #[cfg(feature = "_tls-any")]
+            cert_provider_registry,
+        })
     }
 
-    /// Internal builder that wires the service stack from a pre-built cache.
-    ///
-    /// Separated from `build_tonic_grpc_channel` so tests can inject a
-    /// disconnected `XdsClient` and pre-populated cache.
-    fn build_from_cache(
+    /// Wires the shared routing / retry / load-balancing stack from a pre-built
+    /// [`XdsRuntimeParts`] and a caller-chosen connector, type-erasing it into an
+    /// [`XdsTransportChannel`]. Both the gRPC and transport-generic entry points
+    /// funnel through here; only the connector and the `to_endpoint_req` body
+    /// reconstruction differ per transport.
+    fn build_channel<MC, B, ReqBody, ResBody, F>(
         &self,
-        cache: Arc<XdsCache>,
-        #[cfg(feature = "_tls-any")] cert_provider_registry: Arc<CertProviderRegistry>,
-        xds_client: XdsClient,
-        resource_manager: XdsResourceManager,
-    ) -> XdsChannelGrpc {
+        parts: XdsRuntimeParts,
+        make_connector: MC,
+        to_endpoint_req: F,
+    ) -> XdsTransportChannel<B, ResBody>
+    where
+        MC: MakeConnector,
+        MC::Service: Service<
+                Request<ReqBody>,
+                Response = Response<ResBody>,
+                Error: Into<BoxError>,
+                Future: Send + 'static,
+            > + Load<Metric: Debug>
+            + Send
+            + 'static,
+        F: Fn(Request<SharedBody<B>>) -> Request<ReqBody> + Clone + Send + Sync + 'static,
+        B: Body + Unpin + Send + 'static,
+        B::Data: Clone + Send + Sync,
+        B::Error: Clone + Send + Sync,
+        ReqBody: Send + 'static,
+        ResBody: Send + 'static,
+    {
         let router: Arc<dyn Router> = Arc::new(match self.retry_classifier_factory.clone() {
-            Some(factory) => XdsRouter::with_retry_factory(&cache, factory),
-            None => XdsRouter::new(&cache),
+            Some(factory) => XdsRouter::with_retry_factory(&parts.cache, factory),
+            None => XdsRouter::new(&parts.cache),
         });
 
         // Fallback retry config for requests that carry no per-route config
@@ -401,46 +456,145 @@ impl XdsChannelBuilder {
         // come from RDS via the request's `RouteDecision`; see `RetryLayer`.
         let retry_layer = RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default()));
 
-        #[cfg(feature = "_tls-any")]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(
-            cache,
-            GrpcMakeConnector::new(cert_provider_registry),
-        ));
-        #[cfg(not(feature = "_tls-any"))]
-        let discovery: Arc<
-            dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, GrpcMakeConnector::new()));
+        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> =
+            Arc::new(XdsClusterDiscovery::new(parts.cache, make_connector));
 
         let resources = Arc::new(XdsChannelResources {
-            _resource_manager: resource_manager,
-            _xds_client: xds_client,
+            _resource_manager: parts.resource_manager,
+            _xds_client: parts.xds_client,
         });
 
         let routing_layer = XdsRoutingLayer::new(router, self.pre_route.clone(), self.authority());
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
+        self.assemble_channel_stack::<MC::Service, B, ReqBody, ResBody, _>(
+            routing_layer,
+            retry_layer,
+            discovery,
+            to_endpoint_req,
+            Some(resources),
+        )
+    }
+
+    /// gRPC specialization of [`build_channel`](Self::build_channel): wires the
+    /// tonic `Channel` connector (with the cert-provider registry under a TLS
+    /// feature) and reconstructs each endpoint request body as [`TonicBody`].
+    /// Separated so tests can inject a disconnected `XdsClient` and a
+    /// pre-populated cache via [`XdsRuntimeParts`].
+    fn build_grpc_channel_from_runtime(&self, parts: XdsRuntimeParts) -> XdsChannelGrpc {
+        #[cfg(feature = "_tls-any")]
+        let make_connector = GrpcMakeConnector::new(parts.cert_provider_registry.clone());
+        #[cfg(not(feature = "_tls-any"))]
+        let make_connector = GrpcMakeConnector::new();
+        self.build_channel::<GrpcMakeConnector, TonicBody, TonicBody, TonicBody, _>(
+            parts,
+            make_connector,
+            |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
+        )
+    }
+
+    /// Assembles the routing / retry / load-balancing service stack shared by
+    /// every transport, and type-erases it into an [`XdsTransportChannel`].
+    ///
+    /// The stack is, outermost to innermost: the routing layer (stamps the
+    /// matched `RouteDecision`), the retry layer (buffers the body into
+    /// [`SharedBody`] and retries per the route's config), a `map_request` that
+    /// reconstructs the endpoint's request body from the buffered `SharedBody`,
+    /// and the load balancer that dispatches to the discovered endpoints.
+    ///
+    /// `to_endpoint_req` adapts `Request<SharedBody<B>>` to the endpoint's
+    /// `Request<ReqBody>`: the built-in gRPC path rewraps into [`TonicBody`],
+    /// while transport-generic callers pass the body through unchanged
+    /// (`ReqBody = SharedBody<B>`).
+    fn assemble_channel_stack<EpService, B, ReqBody, ResBody, F>(
+        &self,
+        routing_layer: XdsRoutingLayer,
+        retry_layer: RetryLayer,
+        discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EpService>>,
+        to_endpoint_req: F,
+        resources: Option<Arc<XdsChannelResources>>,
+    ) -> XdsTransportChannel<B, ResBody>
+    where
+        EpService: Service<Request<ReqBody>, Response = Response<ResBody>> + Load + Send + 'static,
+        EpService::Error: Into<BoxError>,
+        EpService::Future: Send + 'static,
+        EpService::Metric: Debug,
+        F: Fn(Request<SharedBody<B>>) -> Request<ReqBody> + Clone + Send + Sync + 'static,
+        B: Body + Unpin + Send + 'static,
+        B::Data: Clone + Send + Sync,
+        B::Error: Clone + Send + Sync,
+        ReqBody: Send + 'static,
+        ResBody: Send + 'static,
+    {
+        let cluster_registry =
+            Arc::new(ClusterClientRegistry::<Request<ReqBody>, Response<ResBody>>::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
-            .map_request(|req: Request<shared_http_body::SharedBody<TonicBody>>| {
-                req.map(TonicBody::new)
-            })
+            .map_request(to_endpoint_req)
             .service(lb_service);
 
         BoxCloneSyncService::new(XdsChannel {
             config: self.config.clone(),
             inner,
-            _resources: Some(resources),
+            _resources: resources,
         })
     }
 
     /// Builds an `XdsChannelGrpc`, which is a type-erased gRPC channel.
-    // TODO: Support HTTP and other channel types (not just gRPC). This will
-    // require a generic `build()` or separate `build_http_channel()` method.
+    ///
+    /// This is the gRPC specialization of
+    /// [`build_transport_channel`](Self::build_transport_channel).
     pub fn build_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
         self.build_tonic_grpc_channel()
+    }
+
+    /// Builds a transport-generic xDS channel using a custom connector factory.
+    ///
+    /// Generalizes [`build_grpc_channel`](Self::build_grpc_channel) to any
+    /// transport: routing, retry, and load balancing are wired identically to
+    /// the gRPC channel, but endpoint connections are produced by the supplied
+    /// [`MakeConnector`]. The returned channel is a
+    /// `Service<Request<B>, Response = Response<ResBody>>`.
+    ///
+    /// The connector's endpoint service consumes `Request<SharedBody<B>>` — the
+    /// retry-buffered request body — so failed attempts can be replayed. As
+    /// [`SharedBody<B>`] implements [`http_body::Body`], a hyper/HTTP-based
+    /// endpoint can forward it directly.
+    ///
+    /// # Retry semantics
+    ///
+    /// Per-route retry policies are compiled by the [`RetryClassifierFactory`]
+    /// set via
+    /// [`with_retry_classifier_factory`](Self::with_retry_classifier_factory).
+    /// The default gRPC factory only produces status-code retries for gRPC
+    /// responses, so a non-gRPC transport supplies its own factory to interpret
+    /// `retry_on` (e.g. `5xx`, `gateway-error`) for that transport. Without a
+    /// custom factory only connection-error retries take effect.
+    pub fn build_transport_channel<MC, B, ResBody>(
+        &self,
+        make_connector: MC,
+    ) -> Result<XdsTransportChannel<B, ResBody>, BuildError>
+    where
+        MC: MakeConnector,
+        MC::Service: Service<
+                Request<SharedBody<B>>,
+                Response = Response<ResBody>,
+                Error: Into<BoxError>,
+                Future: Send + 'static,
+            > + Load<Metric: Debug>
+            + Send
+            + 'static,
+        B: Body + Unpin + Send + 'static,
+        B::Data: Clone + Send + Sync,
+        B::Error: Clone + Send + Sync,
+        ResBody: Send + 'static,
+    {
+        let parts = self.build_xds_parts()?;
+        Ok(self.build_channel::<MC, B, SharedBody<B>, ResBody, _>(
+            parts,
+            make_connector,
+            |req: Request<SharedBody<B>>| req,
+        ))
     }
 
     /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
@@ -455,20 +609,13 @@ impl XdsChannelBuilder {
     ) -> XdsChannelGrpc {
         let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
         let retry_layer = RetryLayer::new(retry);
-        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery);
-        let inner = ServiceBuilder::new()
-            .layer(routing_layer)
-            .layer(retry_layer)
-            .map_request(|req: Request<shared_http_body::SharedBody<TonicBody>>| {
-                req.map(TonicBody::new)
-            })
-            .service(lb_service);
-        BoxCloneSyncService::new(XdsChannel {
-            config: self.config.clone(),
-            inner,
-            _resources: None,
-        })
+        self.assemble_channel_stack::<EndpointChannel<Channel>, TonicBody, TonicBody, TonicBody, _>(
+            routing_layer,
+            retry_layer,
+            discovery,
+            |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
+            None,
+        )
     }
 
     /// Channel-level authority used as the routing key for matching against
@@ -501,6 +648,7 @@ mod tests {
     use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::route_config::RouteConfigResource;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use tokio::sync::mpsc;
     use tonic::transport::Channel;
     use tower::discover::Change;
@@ -937,7 +1085,8 @@ mod tests {
     /// Smoke test: verifies builder wiring with a disconnected XdsClient
     /// doesn't panic during construction.
     #[tokio::test]
-    async fn test_build_from_cache_smoke() {
+    async fn test_build_grpc_channel_from_runtime_smoke() {
+        use super::XdsRuntimeParts;
         use crate::xds::resource_manager::XdsResourceManager;
 
         let cache = Arc::new(XdsCache::new());
@@ -948,16 +1097,170 @@ mod tests {
         let builder = XdsChannelBuilder::new(test_config());
 
         #[cfg(feature = "_tls-any")]
-        let _channel = {
+        let parts = {
             use crate::xds::cert_provider::CertProviderRegistry;
-            let registry = Arc::new(
+            let cert_provider_registry = Arc::new(
                 CertProviderRegistry::from_bootstrap(&Default::default(), Default::default())
                     .unwrap(),
             );
-            builder.build_from_cache(cache, registry, xds_client, resource_manager)
+            XdsRuntimeParts {
+                cache,
+                xds_client,
+                resource_manager,
+                cert_provider_registry,
+            }
         };
         #[cfg(not(feature = "_tls-any"))]
-        let _channel = builder.build_from_cache(cache, xds_client, resource_manager);
+        let parts = XdsRuntimeParts {
+            cache,
+            xds_client,
+            resource_manager,
+        };
+        let _channel = builder.build_grpc_channel_from_runtime(parts);
         // Construction should succeed without panicking.
     }
+
+    /// Minimal body whose `Clone` `Data`/`Error` satisfy `SharedBody`'s bounds.
+    struct TestBody(Option<bytes::Bytes>);
+
+    impl http_body::Body for TestBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.0.take().map(|b| Ok(http_body::Frame::data(b))))
+        }
+    }
+
+    /// Endpoint that replies with a fixed `x-echo` marker header.
+    #[derive(Clone)]
+    struct EchoEndpoint;
+
+    impl tower::Service<super::Request<shared_http_body::SharedBody<TestBody>>> for EchoEndpoint {
+        type Response = super::Response<TestBody>;
+        type Error = tower::BoxError;
+        type Future = crate::common::async_util::BoxFuture<Result<Self::Response, Self::Error>>;
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(
+            &mut self,
+            _req: super::Request<shared_http_body::SharedBody<TestBody>>,
+        ) -> Self::Future {
+            Box::pin(async move {
+                let mut resp = super::Response::new(TestBody(None));
+                resp.headers_mut()
+                    .insert("x-echo", http::HeaderValue::from_static("ok"));
+                Ok(resp)
+            })
+        }
+    }
+
+    struct MockHttpDiscovery;
+
+    impl ClusterDiscovery<EndpointAddress, EndpointChannel<EchoEndpoint>> for MockHttpDiscovery {
+        fn discover_cluster(
+            &self,
+            _cluster_name: &str,
+        ) -> BoxDiscover<EndpointAddress, EndpointChannel<EchoEndpoint>> {
+            let (tx, rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                let addr = EndpointAddress::new("127.0.0.1", 1);
+                let change = Change::Insert(addr, EndpointChannel::new(EchoEndpoint));
+                let _ = tx.send(Ok(change)).await;
+            });
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+        }
+    }
+
+    struct StaticRouter;
+
+    impl Router for StaticRouter {
+        fn acquire(&self) -> crate::client::route::AcquiredConfig {
+            crate::client::route::AcquiredConfig::Ready(Arc::new(Default::default()))
+        }
+        fn route(
+            &self,
+            _input: &RouteInput<'_>,
+            _config: &crate::client::route::RoutingSnapshot,
+        ) -> Result<RouteDecision, crate::xds::routing::RoutingError> {
+            Ok(RouteDecision {
+                cluster: "test-cluster".to_string(),
+                request_hash: None,
+                retry_config: None,
+            })
+        }
+    }
+
+    /// The transport-generic stack routes an arbitrary (non-gRPC) body through
+    /// routing -> retry -> load balancing to a custom endpoint service.
+    #[tokio::test]
+    async fn test_transport_generic_channel_routes_non_grpc_body() {
+        use crate::client::retry::RetryLayer;
+        use crate::client::route::XdsRoutingLayer;
+        use tower::{Service, ServiceExt};
+
+        let builder = XdsChannelBuilder::new(test_config());
+        let router: Arc<dyn Router> = Arc::new(StaticRouter);
+        let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<EchoEndpoint>>> =
+            Arc::new(MockHttpDiscovery);
+        let routing_layer = XdsRoutingLayer::new(router, None, builder.authority());
+        let retry_layer = RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default()));
+
+        let mut channel = builder.assemble_channel_stack::<
+            EndpointChannel<EchoEndpoint>,
+            TestBody,
+            shared_http_body::SharedBody<TestBody>,
+            TestBody,
+            _,
+        >(routing_layer, retry_layer, discovery, |req| req, None);
+
+        let request = super::Request::new(TestBody(Some(bytes::Bytes::from_static(b"hi"))));
+        let response = channel
+            .ready()
+            .await
+            .unwrap()
+            .call(request)
+            .await
+            .expect("transport-generic request should route and respond");
+        assert_eq!(response.headers().get("x-echo").unwrap(), "ok");
+    }
+
+    /// Custom connector whose endpoint consumes the retry-buffered `SharedBody`
+    /// directly — the shape a hyper/HTTP transport uses.
+    struct MockHttpConnector;
+
+    impl crate::client::endpoint::Connector for MockHttpConnector {
+        type Service = EndpointChannel<EchoEndpoint>;
+        fn connect(
+            &self,
+            _addr: &EndpointAddress,
+        ) -> crate::common::async_util::BoxFuture<Self::Service> {
+            Box::pin(async move { EndpointChannel::new(EchoEndpoint) })
+        }
+    }
+
+    struct MockHttpMakeConnector;
+
+    impl crate::client::endpoint::MakeConnector for MockHttpMakeConnector {
+        type Service = EndpointChannel<EchoEndpoint>;
+        fn make_connector(
+            &self,
+            _cluster: crate::client::endpoint::ClusterConfig<'_>,
+        ) -> Result<
+            Arc<dyn crate::client::endpoint::Connector<Service = Self::Service> + Send + Sync>,
+            tower::BoxError,
+        > {
+            Ok(Arc::new(MockHttpConnector))
+        }
+    }
+
+    /// Compile-time proof that the public transport-generic entry point is
+    /// satisfiable by a custom `MakeConnector` (the HTTP-transport shape).
+    const _: fn() = || {
+        let _ =
+            XdsChannelBuilder::build_transport_channel::<MockHttpMakeConnector, TestBody, TestBody>;
+    };
 }
