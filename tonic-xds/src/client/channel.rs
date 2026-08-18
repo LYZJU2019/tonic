@@ -24,8 +24,6 @@
 
 use crate::client::cluster::ClusterClientRegistry;
 use crate::client::endpoint::{EndpointAddress, MakeConnector};
-#[cfg(test)]
-use crate::client::endpoint::EndpointChannel;
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{PreRouteInterceptor, Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
@@ -45,8 +43,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::{body::Body as TonicBody, client::GrpcService};
-#[cfg(test)]
-use tonic::transport::channel::Channel;
 use tower::{BoxError, Service, ServiceBuilder, load::Load, util::BoxCloneSyncService};
 use xds_client::{
     ClientConfig, MetricsRecorder, Node, ProstCodec, TokioRuntime, TonicTransportBuilder, XdsClient,
@@ -597,27 +593,6 @@ impl XdsChannelBuilder {
         ))
     }
 
-    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
-    /// config, and optional pre-route interceptor.
-    #[cfg(test)]
-    pub(crate) fn build_grpc_channel_from_parts(
-        &self,
-        router: Arc<dyn Router>,
-        discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
-        retry: Arc<RetrySharedConfig>,
-        interceptor: Option<Arc<dyn PreRouteInterceptor>>,
-    ) -> XdsChannelGrpc {
-        let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
-        let retry_layer = RetryLayer::new(retry);
-        self.assemble_channel_stack::<EndpointChannel<Channel>, TonicBody, TonicBody, TonicBody, _>(
-            routing_layer,
-            retry_layer,
-            discovery,
-            |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
-            None,
-        )
-    }
-
     /// Channel-level authority used as the routing key for matching against
     /// `VirtualHost.domains` in RDS.
     fn authority(&self) -> Arc<str> {
@@ -638,6 +613,7 @@ mod tests {
     }
     use crate::client::lb::{BoxDiscover, ClusterDiscovery};
     use crate::client::retry::RetrySharedConfig;
+    use crate::client::route::PreRouteInterceptor;
     use crate::client::route::RouteDecision;
     use crate::client::route::RouteInput;
     use crate::client::route::Router;
@@ -652,6 +628,34 @@ mod tests {
     use tokio::sync::mpsc;
     use tonic::transport::Channel;
     use tower::discover::Change;
+
+    impl super::XdsChannelBuilder {
+        /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, retry
+        /// config, and optional pre-route interceptor.
+        pub(crate) fn build_grpc_channel_from_parts(
+            &self,
+            router: Arc<dyn Router>,
+            discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
+            retry: Arc<RetrySharedConfig>,
+            interceptor: Option<Arc<dyn PreRouteInterceptor>>,
+        ) -> XdsChannelGrpc {
+            use crate::client::retry::RetryLayer;
+            use crate::client::route::XdsRoutingLayer;
+            use http::Request;
+            use shared_http_body::SharedBody;
+            use tonic::body::Body as TonicBody;
+
+            let routing_layer = XdsRoutingLayer::new(router, interceptor, self.authority());
+            let retry_layer = RetryLayer::new(retry);
+            self.assemble_channel_stack::<EndpointChannel<Channel>, TonicBody, TonicBody, TonicBody, _>(
+                routing_layer,
+                retry_layer,
+                discovery,
+                |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
+                None,
+            )
+        }
+    }
 
     /// Sets up multiple gRPC test servers and returns their addresses, clients and shutdown handles.
     async fn setup_grpc_servers(
