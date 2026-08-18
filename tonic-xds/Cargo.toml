@@ -110,11 +110,11 @@ allowed_external_types = [
     "bytes::*",
     "http::*",
     "http_body::*",
-    "shared_http_body::*",
 
     # not major released
     "prost::*",
     "opentelemetry::*",
+    "shared_http_body::*",
 
     "tower_service::Service",
     "tower::BoxError",

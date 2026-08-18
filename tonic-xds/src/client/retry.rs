@@ -305,6 +305,27 @@ impl RetryClassifier for GrpcRetryClassifier {
     }
 }
 
+/// Transport-agnostic default [`RetryClassifier`]: retries only on a retryable
+/// connection error and performs no per-retry header mutation. Used as the
+/// fallback for non-gRPC transports so connection-level retries don't stamp the
+/// gRPC-specific `grpc-previous-rpc-attempts` header (which would be confusing on
+/// e.g. plain HTTP traffic).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ConnectionErrorRetryClassifier;
+
+impl RetryClassifier for ConnectionErrorRetryClassifier {
+    fn is_retryable(&self, outcome: RetryOutcome<'_>) -> bool {
+        match outcome {
+            RetryOutcome::Error(err) => is_retryable_connection_error(err.as_ref()),
+            // No transport-specific status semantics: the default never retries a
+            // response. Per-route classifiers handle status-based retries.
+            RetryOutcome::Response { .. } => false,
+        }
+    }
+    // `prepare_retry` uses the trait default (no-op): the transport-agnostic
+    // fallback must not stamp any gRPC-specific retry header.
+}
+
 /// Default [`RetryClassifierFactory`] for gRPC: maps `retry_on` to retryable
 /// [`tonic::Code`]s and builds a `GrpcRetryClassifier`. Returns `None` when no
 /// condition maps to a gRPC code, so the route falls back to the layer default
@@ -360,11 +381,22 @@ impl RetrySharedConfig {
 
     /// Shared config with default knobs and a default [`GrpcRetryClassifier`]
     /// (empty `retry_on`: status-code retries inactive, connection retries still
-    /// apply). Used as the gRPC layer fallback.
+    /// apply, stamping `grpc-previous-rpc-attempts` on each). Used as the gRPC
+    /// layer fallback.
     pub(crate) fn grpc_default() -> Self {
         Self::new(
             RetryConfig::default(),
             Arc::new(GrpcRetryClassifier::default()),
+        )
+    }
+
+    /// Shared config with default knobs and a transport-agnostic
+    /// [`ConnectionErrorRetryClassifier`] (connection-error retries only, no
+    /// per-retry header mutation). Used as the fallback for non-gRPC transports.
+    pub(crate) fn connection_default() -> Self {
+        Self::new(
+            RetryConfig::default(),
+            Arc::new(ConnectionErrorRetryClassifier),
         )
     }
 }
@@ -727,6 +759,48 @@ mod tests {
         let response = http::Response::builder().body(()).unwrap();
         let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
         assert!(!classifier.is_retryable(RetryOutcome::from_result(&result)));
+    }
+
+    // --- ConnectionErrorRetryClassifier tests ---
+
+    #[test]
+    fn test_connection_classifier_retries_connection_error() {
+        let classifier = ConnectionErrorRetryClassifier;
+        let err: tower::BoxError =
+            Box::new(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+        let result: Result<http::Response<()>, tower::BoxError> = Err(err);
+        assert!(classifier.is_retryable(RetryOutcome::from_result(&result)));
+    }
+
+    #[test]
+    fn test_connection_classifier_ignores_responses() {
+        // The transport-agnostic default never retries a response: even a gRPC
+        // UNAVAILABLE trailer is left to per-route (transport-specific) classifiers.
+        let classifier = ConnectionErrorRetryClassifier;
+        let response = http::Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .header("grpc-status", "14")
+            .body(())
+            .unwrap();
+        let result: Result<http::Response<()>, tower::BoxError> = Ok(response);
+        assert!(!classifier.is_retryable(RetryOutcome::from_result(&result)));
+    }
+
+    #[test]
+    fn test_connection_classifier_does_not_stamp_grpc_header() {
+        // The whole point of the generic default: connection retries must not add
+        // the gRPC-specific `grpc-previous-rpc-attempts` header.
+        let mut generic_headers = http::HeaderMap::new();
+        ConnectionErrorRetryClassifier.prepare_retry(&mut generic_headers, 1);
+        assert!(generic_headers.is_empty());
+
+        // Contrast: the gRPC default *does* stamp the header on the same retry.
+        let mut grpc_headers = http::HeaderMap::new();
+        GrpcRetryClassifier::default().prepare_retry(&mut grpc_headers, 1);
+        assert_eq!(
+            grpc_headers[GRPC_PREVIOUS_RPC_ATTEMPTS].to_str().unwrap(),
+            "1"
+        );
     }
 
     // --- RetryBackoffConfig tests ---

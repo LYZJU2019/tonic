@@ -417,13 +417,19 @@ impl XdsChannelBuilder {
     /// Wires the shared routing / retry / load-balancing stack from a pre-built
     /// [`XdsRuntimeParts`] and a caller-chosen connector, type-erasing it into an
     /// [`XdsTransportChannel`]. Both the gRPC and transport-generic entry points
-    /// funnel through here; only the connector and the `to_endpoint_req` body
-    /// reconstruction differ per transport.
+    /// funnel through here; the connector, the `to_endpoint_req` body
+    /// reconstruction, and the `fallback_retry` config differ per transport.
+    ///
+    /// `fallback_retry` is applied to requests that carry no per-route retry
+    /// config; callers pass a transport-appropriate default (see
+    /// [`RetrySharedConfig::grpc_default`] vs
+    /// [`RetrySharedConfig::connection_default`]).
     fn build_channel<MC, B, ReqBody, ResBody, F>(
         &self,
         parts: XdsRuntimeParts,
         make_connector: MC,
         to_endpoint_req: F,
+        fallback_retry: Arc<RetrySharedConfig>,
     ) -> XdsTransportChannel<B, ResBody>
     where
         MC: MakeConnector,
@@ -432,9 +438,7 @@ impl XdsChannelBuilder {
                 Response = Response<ResBody>,
                 Error: Into<BoxError>,
                 Future: Send + 'static,
-            > + Load<Metric: Debug>
-            + Send
-            + 'static,
+            > + Load<Metric: Debug>,
         F: Fn(Request<SharedBody<B>>) -> Request<ReqBody> + Clone + Send + Sync + 'static,
         B: Body + Unpin + Send + 'static,
         B::Data: Clone + Send + Sync,
@@ -448,9 +452,12 @@ impl XdsChannelBuilder {
         });
 
         // Fallback retry config for requests that carry no per-route config
-        // (non-xDS callers, or a route with no retry policy). Per-route configs
-        // come from RDS via the request's `RouteDecision`; see `RetryLayer`.
-        let retry_layer = RetryLayer::new(Arc::new(RetrySharedConfig::grpc_default()));
+        // (non-xDS callers, or a route with no retry policy). The caller supplies
+        // a transport-appropriate default: the gRPC path stamps the
+        // `grpc-previous-rpc-attempts` header on connection retries, while
+        // transport-generic callers retry connection errors without it. Per-route
+        // configs come from RDS via the request's `RouteDecision`; see `RetryLayer`.
+        let retry_layer = RetryLayer::new(fallback_retry);
 
         let discovery: Arc<dyn ClusterDiscovery<EndpointAddress, MC::Service>> =
             Arc::new(XdsClusterDiscovery::new(parts.cache, make_connector));
@@ -484,6 +491,7 @@ impl XdsChannelBuilder {
             parts,
             make_connector,
             |req: Request<SharedBody<TonicBody>>| req.map(TonicBody::new),
+            Arc::new(RetrySharedConfig::grpc_default()),
         )
     }
 
@@ -566,6 +574,9 @@ impl XdsChannelBuilder {
     /// responses, so a non-gRPC transport supplies its own factory to interpret
     /// `retry_on` (e.g. `5xx`, `gateway-error`) for that transport. Without a
     /// custom factory only connection-error retries take effect.
+    ///
+    /// TODO: The cert-provider registry and the per-cluster TLS view
+    /// (`ClusterConfig::security`) are not yet exposed publicly, will address in following PR
     pub fn build_transport_channel<MC, B, ResBody>(
         &self,
         make_connector: MC,
@@ -577,9 +588,7 @@ impl XdsChannelBuilder {
                 Response = Response<ResBody>,
                 Error: Into<BoxError>,
                 Future: Send + 'static,
-            > + Load<Metric: Debug>
-            + Send
-            + 'static,
+            > + Load<Metric: Debug>,
         B: Body + Unpin + Send + 'static,
         B::Data: Clone + Send + Sync,
         B::Error: Clone + Send + Sync,
@@ -590,6 +599,7 @@ impl XdsChannelBuilder {
             parts,
             make_connector,
             |req: Request<SharedBody<B>>| req,
+            Arc::new(RetrySharedConfig::connection_default()),
         ))
     }
 
