@@ -189,6 +189,10 @@ pub use xds_client::TonicCallCredentials;
 
 #[cfg(feature = "_tls-any")]
 pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};
+/// Re-export of the rustls trait returned by [`ClusterTlsConfig::build_verifier`],
+/// so custom transports can name it without a direct `rustls` dependency.
+#[cfg(feature = "_tls-any")]
+pub use rustls::client::danger::ServerCertVerifier;
 #[cfg(feature = "_tls-any")]
 pub use xds::cert_provider::{CertProviderError, CertificateData, CertificateProvider, Identity};
 

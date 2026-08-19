@@ -319,7 +319,7 @@ impl ClusterTlsConfig<'_> {
     /// Build once per CDS update in [`MakeConnector::make_connector`] and clone
     /// the returned `Arc` per connection; not for the per-request hot path.
     ///
-    /// [`ServerCertVerifier`]: rustls::client::danger::ServerCertVerifier
+    /// [`ServerCertVerifier`]: crate::ServerCertVerifier
     pub fn build_verifier(
         &self,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, ClusterTlsError> {
