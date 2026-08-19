@@ -212,12 +212,12 @@ pub trait Connector {
 /// tailored to the cluster.
 ///
 /// Besides the cluster name, the view exposes the cluster's parsed TLS
-/// settings via [`tls`](Self::tls) (under a TLS feature). The view is
+/// settings via its `tls()` accessor (under a TLS feature). The view is
 /// otherwise opaque: internal matcher and registry types are never surfaced.
 pub struct ClusterConfig<'a> {
     name: &'a str,
     /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal;
-    /// read publicly through [`ClusterConfig::tls`].
+    /// read publicly through `ClusterConfig::tls`.
     pub(crate) security: Option<&'a ClusterSecurityConfig>,
     /// Cert-provider registry. Ambient here so [`ClusterTlsConfig`] can resolve
     /// provider instance names without the caller handling the registry.
