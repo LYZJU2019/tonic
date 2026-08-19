@@ -218,12 +218,9 @@ impl MakeConnector for GrpcMakeConnector {
     }
 }
 
-/// Build a [`Connector`] for the given cluster view.
-///
-/// - plaintext cluster → [`PlaintextConnector`].
-/// - TLS cluster under a TLS feature → [`TlsConnector`] built from the
-///   public [`ClusterTlsConfig`] view.
-/// - TLS cluster without a TLS feature → error.
+/// Build a [`Connector`] for the given cluster view: plaintext clusters get a
+/// [`PlaintextConnector`]; TLS clusters get a [`TlsConnector`] built from the
+/// public [`ClusterTlsConfig`] view, or an error when no TLS feature is on.
 fn build_connector(
     cluster: &ClusterConfig<'_>,
 ) -> Result<Arc<dyn Connector<Service = EndpointChannel<Channel>> + Send + Sync>, ConnectorBuildError>
@@ -279,19 +276,14 @@ impl Connector for PlaintextConnector {
 }
 
 /// TLS [`Connector`] for clusters whose CDS resource carries an
-/// `UpstreamTlsContext`. Holds:
+/// `UpstreamTlsContext`. Holds a verifier that re-reads CA roots from its
+/// [`CertificateProvider`] each handshake, and an optional mTLS identity
+/// provider fetched per `connect` — so `file_watcher`-driven CA/identity
+/// rotation reaches new connections.
 ///
-/// - a verifier that reads CA roots from its [`CertificateProvider`] on
-///   each handshake (so `file_watcher`-driven CA rotation is picked up
-///   automatically), and
-/// - an optional identity provider for mTLS — fetched per `connect` call
-///   so identity rotation is picked up on each new connection.
-///
-/// Built from the public [`ClusterTlsConfig`] view (via [`TlsConnector::new`]),
-/// exactly as an out-of-tree connector would build its own. The connector is
-/// rebuilt by [`build_connector`] on every CDS update, so changes to
-/// `ca_instance_name` / `identity_instance_name` / SAN matchers also propagate
-/// as the cluster watch swaps the connector.
+/// Built from the public [`ClusterTlsConfig`] view, exactly as an out-of-tree
+/// connector would. [`build_connector`] rebuilds it on every CDS update, so
+/// changed instance names or SAN matchers propagate as the connector swaps.
 #[cfg(feature = "_tls-any")]
 pub(crate) struct TlsConnector {
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -317,9 +309,8 @@ impl Connector for TlsConnector {
 
         let verifier: Arc<dyn ServerCertVerifier> = self.verifier.clone();
 
-        // Identity is fetched per `connect` so file_watcher-driven identity
-        // rotation reaches each new connection. `Identity::from_pem` is
-        // bytes-only; the rustls parse happens inside `tls_config_with_verifier`.
+        // Fetch identity per `connect` so file_watcher-driven rotation reaches
+        // each new connection.
         let identity = self
             .identity_provider
             .as_ref()
@@ -350,10 +341,9 @@ impl Connector for TlsConnector {
         let channel = match endpoint.tls_config_with_verifier(tls_config, verifier) {
             Ok(ep) => ep.connect_lazy(),
             Err(e) => {
-                // tls_config_with_verifier only errors on UDS endpoints
-                // (see tonic's endpoint.rs), which we never construct. The
-                // defensive fallback returns a non-TLS lazy channel — the
-                // request will fail at the wire, surfacing the misconfig.
+                // `tls_config_with_verifier` only errors for UDS endpoints,
+                // which we never construct; fall back to a non-TLS lazy channel
+                // so the misconfig surfaces at the wire, not here.
                 tracing::error!(
                     error = %e, address = %addr,
                     "tls_config_with_verifier failed; non-TLS lazy fallback",
@@ -416,8 +406,6 @@ mod tests {
         CertProviderRegistry::from_bootstrap(&HashMap::new(), HashMap::new()).unwrap()
     }
 
-    /// Registry pre-populated with named provider instances (injected, so no
-    /// bootstrap files are touched).
     #[cfg(feature = "_tls-any")]
     fn registry_with(providers: &[(&str, Arc<dyn CertificateProvider>)]) -> CertProviderRegistry {
         use std::collections::HashMap;
@@ -428,7 +416,6 @@ mod tests {
         CertProviderRegistry::from_bootstrap(&HashMap::new(), injected).unwrap()
     }
 
-    /// A [`CertificateProvider`] returning fixed material.
     #[cfg(feature = "_tls-any")]
     struct StaticProvider(Arc<CertificateData>);
     #[cfg(feature = "_tls-any")]
@@ -445,7 +432,6 @@ mod tests {
         })))
     }
 
-    /// Plaintext dispatch under TLS feature.
     #[cfg(feature = "_tls-any")]
     #[test]
     fn build_connector_plaintext_tls_feature_on() {
@@ -455,7 +441,6 @@ mod tests {
         assert!(build_connector(&config).is_ok());
     }
 
-    /// Plaintext dispatch without any TLS feature.
     #[cfg(not(feature = "_tls-any"))]
     #[test]
     fn build_connector_plaintext_no_tls() {
@@ -464,8 +449,6 @@ mod tests {
         assert!(build_connector(&config).is_ok());
     }
 
-    /// The default `GrpcMakeConnector` builds a connector from a `ClusterConfig`
-    /// view; a cluster with no security config yields a plaintext connector.
     #[cfg(feature = "_tls-any")]
     #[test]
     fn grpc_make_connector_plaintext() {
@@ -478,8 +461,6 @@ mod tests {
         );
     }
 
-    /// Cluster with TLS pointing at an instance not in the registry surfaces
-    /// a clear error — useful for misconfig diagnostics.
     #[cfg(feature = "_tls-any")]
     #[test]
     fn build_connector_tls_unknown_ca() {
@@ -496,11 +477,6 @@ mod tests {
         ));
     }
 
-    // --- Public `ClusterTlsConfig` view (consumed by out-of-tree connectors
-    // exactly as the built-in gRPC connector consumes it) ------------------
-
-    /// `ClusterConfig::tls` is `None` for a plaintext cluster and `Some` for a
-    /// TLS cluster, echoing the parsed CA / identity instance names.
     #[cfg(feature = "_tls-any")]
     #[test]
     fn cluster_tls_view_exposes_instance_names() {
@@ -524,8 +500,6 @@ mod tests {
         assert_eq!(config.tls().unwrap().identity_instance_name(), None);
     }
 
-    /// `build_verifier` resolves the CA instance against the registry; an
-    /// unknown CA instance is a clear error.
     #[cfg(feature = "_tls-any")]
     #[test]
     fn cluster_tls_build_verifier() {
@@ -543,8 +517,6 @@ mod tests {
         ));
     }
 
-    /// `identity_provider` is `None` without mTLS, resolves when configured,
-    /// and errors on an unknown identity instance.
     #[cfg(feature = "_tls-any")]
     #[test]
     fn cluster_tls_identity_provider() {
@@ -569,9 +541,6 @@ mod tests {
         ));
     }
 
-    /// `TlsConnector::connect` fetches the identity provider on every call,
-    /// which is what gives us identity rotation between CDS updates. Counter
-    /// shim verifies the call count without standing up a TLS handshake.
     #[cfg(feature = "_tls-any")]
     #[tokio::test]
     async fn tls_connector_fetches_identity_per_connect() {

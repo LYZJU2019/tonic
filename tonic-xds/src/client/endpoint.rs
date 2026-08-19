@@ -219,9 +219,8 @@ pub struct ClusterConfig<'a> {
     /// Parsed TLS config for the cluster (`None` = plaintext). Crate-internal;
     /// read publicly through [`ClusterConfig::tls`].
     pub(crate) security: Option<&'a ClusterSecurityConfig>,
-    /// Cert-provider registry, resolved from bootstrap. Ambient in the
-    /// make-connector context so [`ClusterTlsConfig`] can resolve provider
-    /// instance names without the caller ever handling the registry directly.
+    /// Cert-provider registry. Ambient here so [`ClusterTlsConfig`] can resolve
+    /// provider instance names without the caller handling the registry.
     #[cfg(feature = "_tls-any")]
     registry: &'a CertProviderRegistry,
 }
@@ -313,15 +312,12 @@ impl ClusterTlsConfig<'_> {
 
     /// Build the gRFC-A29 server-certificate verifier for this cluster.
     ///
-    /// Resolves [`ca_instance_name`](Self::ca_instance_name) against the
-    /// cert-provider registry and returns a rustls [`ServerCertVerifier`] that
-    /// validates the peer chain against the CA bundle — re-reading it from the
-    /// provider on each handshake so CA rotation is picked up — and enforces
-    /// the cluster's SAN matchers.
+    /// Returns a rustls [`ServerCertVerifier`] that validates the peer chain
+    /// against the CA bundle — re-read from the provider each handshake, so CA
+    /// rotation is picked up — and enforces the cluster's SAN matchers.
     ///
-    /// Intended for the connection-setup path: build the verifier once per CDS
-    /// update (in [`MakeConnector::make_connector`]) and clone the returned
-    /// `Arc` per connection. It is not for the per-request hot path.
+    /// Build once per CDS update in [`MakeConnector::make_connector`] and clone
+    /// the returned `Arc` per connection; not for the per-request hot path.
     ///
     /// [`ServerCertVerifier`]: rustls::client::danger::ServerCertVerifier
     pub fn build_verifier(
