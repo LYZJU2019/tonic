@@ -188,6 +188,8 @@ pub use xds::uri::{XdsUri, XdsUriError};
 pub use xds_client::TonicCallCredentials;
 
 #[cfg(feature = "_tls-any")]
+pub use client::endpoint::{ClusterTlsConfig, ClusterTlsError};
+#[cfg(feature = "_tls-any")]
 pub use xds::cert_provider::{CertProviderError, CertificateData, CertificateProvider, Identity};
 
 pub use xds_client::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
