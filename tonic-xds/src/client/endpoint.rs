@@ -377,9 +377,11 @@ pub enum ClusterTlsError {
 
 impl std::fmt::Debug for ClusterConfig<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClusterConfig")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
+        let mut dbg = f.debug_struct("ClusterConfig");
+        dbg.field("name", &self.name);
+        #[cfg(feature = "_tls-any")]
+        dbg.field("tls", &self.tls());
+        dbg.finish_non_exhaustive()
     }
 }
 
