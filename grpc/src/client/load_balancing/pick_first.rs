@@ -32,6 +32,7 @@ use std::sync::atomic::Ordering;
 use rand::seq::SliceRandom;
 
 use crate::client::ConnectivityState;
+use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::LbPolicy;
@@ -43,29 +44,29 @@ use crate::client::load_balancing::Pick;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
 use crate::client::load_balancing::QueuingPicker;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
-use crate::core::RequestHeaders;
+use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 
-pub(crate) static POLICY_NAME: &str = "pick_first";
+pub static POLICY_NAME: &str = "pick_first";
 
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
 #[derive(Debug, serde::Deserialize, Clone)]
-pub(crate) struct PickFirstConfig {
+pub struct PickFirstConfig {
     #[serde(rename = "shuffleAddressList")]
     pub shuffle_address_list: bool,
 }
 
 #[derive(Debug)]
-struct PickFirstBuilder {}
+pub struct PickFirstBuilder {}
 
 impl LbPolicyBuilder for PickFirstBuilder {
     type LbPolicy = PickFirstPolicy;
@@ -100,7 +101,7 @@ pub(crate) fn reg() {
     super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {})
 }
 
-pub(crate) struct PickFirstPolicy {
+pub struct PickFirstPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
     connectivity_state: ConnectivityState,
@@ -585,7 +586,8 @@ impl LbPolicy for PickFirstPolicy {
         }
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        debug_assert!(data.is_none(), "expected no data but got {data:?}");
         if self.connectivity_state == ConnectivityState::Idle {
             // TODO: is it safe to assume any call to work() while idle means we
             // should connect?
@@ -618,7 +620,7 @@ impl Timer {
         let handle = runtime.clone().spawn(Box::pin(async move {
             runtime.sleep(std::time::Duration::from_millis(250)).await;
             expired_clone.store(true, Ordering::SeqCst);
-            work_scheduler.schedule_work();
+            work_scheduler.schedule_work(None);
         }));
         Self { expired, handle }
     }
@@ -668,7 +670,7 @@ impl IdlePicker {
 impl Picker for IdlePicker {
     fn pick(&self, _: &RequestHeaders) -> PickResult {
         if !self.triggered_work.swap(true, Ordering::Relaxed) {
-            self.work_scheduler.schedule_work();
+            self.work_scheduler.schedule_work(None);
         }
         PickResult::Queue
     }
@@ -736,9 +738,9 @@ mod test {
     use std::time::Duration;
 
     use super::*;
-    use crate::client::load_balancing::test_utils::{
-        TestChannelController, TestEvent, TestWorkScheduler,
-    };
+    use crate::client::load_balancing::test_utils::TestChannelController;
+    use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestWorkScheduler;
 
     const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 
@@ -824,7 +826,7 @@ mod test {
 
     fn expect_schedule_work(rx: &mpsc::Receiver<TestEvent>) {
         match rx.try_recv() {
-            Ok(TestEvent::ScheduleWork) => {}
+            Ok(TestEvent::ScheduleWork(_)) => {}
             Ok(other) => panic!("expected ScheduleWork, got {:?}", other),
             Err(e) => panic!("expected ScheduleWork, got error: {:?}", e),
         }
@@ -1220,7 +1222,7 @@ mod test {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Manually call work() to process the timer expiration.
-        policy.work(controller.as_mut());
+        policy.work(None, controller.as_mut());
 
         // Expect Connect event for addr2 due to timer expiration.
         let addr = expect_connect(&rx);
@@ -1496,7 +1498,7 @@ mod test {
             .unwrap()
             .expired
             .store(true, Ordering::SeqCst);
-        policy.work(controller.as_mut());
+        policy.work(None, controller.as_mut());
 
         let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
@@ -1613,7 +1615,7 @@ mod test {
         expect_schedule_work(&rx);
 
         // 6. Call work to execute the scheduled connection attempt.
-        policy.work(controller.as_mut());
+        policy.work(None, controller.as_mut());
 
         // 7. Verify that the policy initiates a reconnection to addr1.
         let addr = expect_connect(&rx);

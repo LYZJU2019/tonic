@@ -51,24 +51,41 @@
 
 pub mod attributes;
 pub mod client;
+pub(crate) mod codec;
 pub mod core;
 pub mod credentials;
 pub mod metadata;
 
-pub(crate) mod inmemory;
-pub(crate) mod server;
-
-mod macros;
-mod status;
-
-pub use status::Status;
-pub use status::StatusCodeError;
-pub use status::StatusError;
-pub use status::StatusOr;
-
 mod byte_str;
+mod inmemory;
+mod macros;
 mod rt;
 mod send_future;
+mod server;
+mod status;
+
+pub use status::Result;
+pub use status::StatusCodeError;
+pub use status::StatusError;
+
+#[cfg(feature = "__unstable")]
+#[doc(hidden)]
+pub mod __unstable {
+    pub mod rt {
+        pub use crate::rt::*;
+    }
+    pub mod client {
+        pub mod load_balancing {
+            pub use crate::client::load_balancing::*;
+        }
+        pub mod name_resolution {
+            pub use crate::client::name_resolution::*;
+        }
+        pub mod service_config {
+            pub use crate::client::service_config::*;
+        }
+    }
+}
 
 mod private {
     /// A zero-sized type used to seal methods on a public trait.

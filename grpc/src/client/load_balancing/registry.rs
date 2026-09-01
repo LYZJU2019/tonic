@@ -36,13 +36,14 @@ use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::ParsedJsonLbConfig;
+use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
 
 /// A registry to store and retrieve LB policies.  LB policies are indexed by
 /// their names.
-pub(crate) struct LbPolicyRegistry {
+pub struct LbPolicyRegistry {
     m: Arc<Mutex<HashMap<String, Arc<DynLbPolicyBuilder>>>>,
 }
 
@@ -53,7 +54,7 @@ impl LbPolicyRegistry {
     }
 
     /// Adds a LB policy into the registry.
-    pub(crate) fn add_builder<B: LbPolicyBuilder>(&self, builder: B) {
+    pub fn add_builder<B: LbPolicyBuilder>(&self, builder: B) {
         self.m
             .lock()
             .unwrap()
@@ -61,7 +62,7 @@ impl LbPolicyRegistry {
     }
 
     /// Adds a dynamic LB policy into the registry.
-    pub(crate) fn add_dyn_builder(&self, builder: Arc<DynLbPolicyBuilder>) {
+    pub fn add_dyn_builder(&self, builder: Arc<DynLbPolicyBuilder>) {
         self.m
             .lock()
             .unwrap()
@@ -69,7 +70,7 @@ impl LbPolicyRegistry {
     }
 
     /// Retrieves a LB policy from the registry, or None if not found.
-    pub(crate) fn get_policy(&self, name: &str) -> Option<Arc<DynLbPolicyBuilder>> {
+    pub fn get_policy(&self, name: &str) -> Option<Arc<DynLbPolicyBuilder>> {
         self.m.lock().unwrap().get(name).cloned()
     }
 }
@@ -80,13 +81,15 @@ impl Default for LbPolicyRegistry {
     }
 }
 
-/// The registry used if a local registry is not provided to a channel or if it
-/// does not exist in the local registry.
-pub(crate) static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> =
-    LazyLock::new(LbPolicyRegistry::new);
+pub static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> = LazyLock::new(|| {
+    let registry = LbPolicyRegistry::new();
+    registry.add_builder(super::pick_first::PickFirstBuilder {});
+    registry.add_builder(super::round_robin::RoundRobinBuilder {});
+    registry
+});
 
-/// Implements DynLbPolicy and DynLbPolicyBuilder around the enclosed LbPolicy
-/// or LbPolicyBuilder, respectively.
+/// Implements `DynLbPolicy` and `DynLbPolicyBuilder` around the enclosed
+/// `LbPolicy` or `LbPolicyBuilder`, respectively.
 #[derive(Debug)]
 struct DynAdapter<T>(T);
 
@@ -135,8 +138,8 @@ impl<T: LbPolicy> LbPolicy for DynAdapter<T> {
             .subchannel_update(subchannel, state, channel_controller);
     }
 
-    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        self.0.work(channel_controller);
+    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
+        self.0.work(data, channel_controller);
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
