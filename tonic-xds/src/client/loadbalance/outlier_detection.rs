@@ -198,15 +198,17 @@ impl OutlierStatsRegistry {
 
         if let Some(sr) = config.success_rate.as_ref() {
             let request_volume = u64::from(sr.request_volume);
-            // Success rate in 0.0..=100.0 for each qualifying host. The
-            // mean/stdev are computed over this set; the threshold is
+            // Success rate in 0.0..=100.0 for each qualifying host with
+            // traffic; a zero-total host has no defined rate and is
+            // excluded so mean/stdev stay finite. The threshold is
             // `mean - stdev * stdev_factor / 1000` (A50 §"success_rate
             // ejection").
             let rates: Vec<f64> = snapshots
                 .iter()
                 .filter_map(|(_, s, f)| {
                     let total = s + f;
-                    (total >= request_volume).then(|| 100.0 * (*s as f64) / (total as f64))
+                    (total >= request_volume && total > 0)
+                        .then(|| 100.0 * (*s as f64) / (total as f64))
                 })
                 .collect();
             if rates.len() >= sr.minimum_hosts as usize && !rates.is_empty() {
@@ -216,28 +218,13 @@ impl OutlierStatsRegistry {
                 let stdev = variance.sqrt();
                 let threshold = mean - stdev * f64::from(sr.stdev_factor) / 1000.0;
                 let max_ejections = self.max_ejections(&config);
-                let now = Instant::now();
-                let enforcing = sr.enforcing_success_rate.get();
-                for (state, s, f) in &snapshots {
-                    let total = s + f;
-                    if total < request_volume || state.is_ejected() {
-                        continue;
-                    }
-                    if self.ejected_count.load(Ordering::Relaxed) >= max_ejections {
-                        break;
-                    }
-                    let rate = 100.0 * (*s as f64) / (total as f64);
-                    if rate >= threshold {
-                        continue;
-                    }
-                    if !roll(enforcing) {
-                        continue;
-                    }
-                    if state.try_eject(now) {
-                        self.ejected_count.fetch_add(1, Ordering::Relaxed);
-                        self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                self.eject_outliers(
+                    &snapshots,
+                    request_volume,
+                    max_ejections,
+                    sr.enforcing_success_rate.get(),
+                    |s, _f, total| 100.0 * (s as f64) / (total as f64) < threshold,
+                );
             }
         }
 
@@ -249,30 +236,15 @@ impl OutlierStatsRegistry {
                 .count() as u64;
             if qualifying >= u64::from(fp.minimum_hosts) {
                 let max_ejections = self.max_ejections(&config);
-                let now = Instant::now();
                 let threshold = u64::from(fp.threshold.get());
-                let enforcing = fp.enforcing_failure_percentage.get();
-                for (state, s, f) in &snapshots {
-                    let total = s + f;
-                    if total < request_volume || state.is_ejected() {
-                        continue;
-                    }
-                    if self.ejected_count.load(Ordering::Relaxed) >= max_ejections {
-                        break;
-                    }
+                self.eject_outliers(
+                    &snapshots,
+                    request_volume,
+                    max_ejections,
+                    fp.enforcing_failure_percentage.get(),
                     // failure_pct = 100 * failure / total. A50 uses strict ">".
-                    let failure_pct = 100 * f / total;
-                    if failure_pct <= threshold {
-                        continue;
-                    }
-                    if !roll(enforcing) {
-                        continue;
-                    }
-                    if state.try_eject(now) {
-                        self.ejected_count.fetch_add(1, Ordering::Relaxed);
-                        self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                    |_s, f, total| 100 * f / total > threshold,
+                );
             }
         }
 
@@ -304,6 +276,46 @@ impl OutlierStatsRegistry {
             let _ = self.ejected_snapshot_tx.send(Arc::new(snapshot));
             self.last_broadcast_version
                 .store(current, Ordering::Relaxed);
+        }
+    }
+
+    /// Shared ejection pass for one detection algorithm: walks
+    /// `snapshots`, skips idle or already-ejected hosts, respects the
+    /// concurrent-ejection cap, and ejects a host when `is_outlier`
+    /// flags it and the enforcement roll passes. Centralizing the loop
+    /// keeps the success-rate and failure-percentage paths from
+    /// drifting apart.
+    ///
+    /// `is_outlier` sees `(success, failure, total)` for a host with
+    /// `total > 0`, so the per-algorithm ratio never divides by zero.
+    fn eject_outliers(
+        &self,
+        snapshots: &[(Arc<OutlierChannelState>, u64, u64)],
+        request_volume: u64,
+        max_ejections: u64,
+        enforcing: u8,
+        is_outlier: impl Fn(u64, u64, u64) -> bool,
+    ) {
+        let now = Instant::now();
+        for (state, s, f) in snapshots {
+            let (s, f) = (*s, *f);
+            let total = s + f;
+            if total == 0 || total < request_volume || state.is_ejected() {
+                continue;
+            }
+            if self.ejected_count.load(Ordering::Relaxed) >= max_ejections {
+                break;
+            }
+            if !is_outlier(s, f, total) {
+                continue;
+            }
+            if !roll(enforcing) {
+                continue;
+            }
+            if state.try_eject(now) {
+                self.ejected_count.fetch_add(1, Ordering::Relaxed);
+                self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -792,26 +804,28 @@ mod tests {
         }
     }
 
-    /// max_ejection_percent applies before per-host eligibility, so
-    /// even when every host is below threshold the cap holds.
+    /// The cap bounds concurrent ejections below the number of eligible
+    /// outliers: two hosts fall below threshold but `5 × 20% = 1` admits
+    /// only one, so exactly one is ejected.
     #[test]
     fn success_rate_max_ejection_percent_caps_concurrent_ejections() {
-        let mut config = sr_config(1900, 10, 3);
+        let mut config = sr_config(1000, 10, 3);
         config.max_ejection_percent = pct(20);
         let registry = make_registry_only(config);
-        // 4 hosts at 100%, 1 at 0%. The outlier is the only candidate
-        // anyway; the cap test value here is that the cap math admits
-        // an ejection (5 × 20% = 1, plus the floor) for the single
-        // outlier, but would clamp tighter populations.
-        let bad = registry.add_channel(addr(8084));
-        for port in 8080..=8083 {
+        // 3 hosts at 100%, 2 at 0%. Both zero-rate hosts fall below the
+        // threshold, so without the cap both would eject; the cap holds
+        // the second one back.
+        let bad1 = registry.add_channel(addr(8083));
+        let bad2 = registry.add_channel(addr(8084));
+        for port in 8080..=8082 {
             let s = registry.add_channel(addr(port));
             drive(&s, 100, 0);
         }
-        drive(&bad, 0, 100);
+        drive(&bad1, 0, 100);
+        drive(&bad2, 0, 100);
         registry.run_housekeeping();
         assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 1);
-        assert!(bad.is_ejected());
+        assert!(bad1.is_ejected() ^ bad2.is_ejected());
     }
 
     /// Both algorithms configured: success-rate runs first and
