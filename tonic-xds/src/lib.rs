@@ -206,9 +206,6 @@ pub use client::channel::{
 pub use client::endpoint::{
     ClusterConfig, Connector, EndpointAddress, EndpointChannel, MakeConnector,
 };
-pub use client::loadbalance::outcome::{
-    CallOutcome, GrpcOutcomeClassifier, HealthOutcome, OutcomeClassifier,
-};
 pub use client::retry::{
     GrpcRetryClassifierFactory, RetryClassifier, RetryClassifierFactory, RetryOutcome,
     is_retryable_connection_error,

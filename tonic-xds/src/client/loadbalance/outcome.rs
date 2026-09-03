@@ -31,14 +31,17 @@
 //! [`GrpcOutcomeClassifier`] interprets gRPC status; a non-gRPC transport (e.g.
 //! plain HTTP) supplies its own to interpret HTTP status codes without touching
 //! the outlier-detection engine.
+//!
+//! The seam is crate-internal for now: nothing outside the crate can inject a
+//! classifier yet. The public builder hook (and the final `#[non_exhaustive]`
+//! shaping of these types) lands with the outlier-detection `Discover` wiring.
 
 /// Borrowed view of one endpoint call's result, handed to
 /// [`OutcomeClassifier::classify`]. It carries no error payload — outlier
 /// detection only needs to know that a call errored, not why — so it works with
 /// the load balancer's generic endpoint error type.
-#[non_exhaustive]
 #[derive(Debug)]
-pub enum CallOutcome<'a> {
+pub(crate) enum CallOutcome<'a> {
     /// The endpoint produced a response; inspect `status`/`headers` (e.g. gRPC's
     /// trailers-only `grpc-status`) to decide.
     Response {
@@ -54,7 +57,7 @@ pub enum CallOutcome<'a> {
 
 /// The health verdict for a single call, recorded by outlier detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthOutcome {
+pub(crate) enum HealthOutcome {
     /// Count the call as a success.
     Success,
     /// Count the call as a failure.
@@ -71,7 +74,7 @@ pub enum HealthOutcome {
 /// [`GrpcOutcomeClassifier`] interprets gRPC status, while a non-gRPC transport
 /// (e.g. plain HTTP) supplies its own to interpret HTTP status codes (`5xx` =
 /// failure, `4xx` = ignore, ...) without touching the outlier-detection engine.
-pub trait OutcomeClassifier: Send + Sync + 'static {
+pub(crate) trait OutcomeClassifier: Send + Sync + 'static {
     /// Classify a single endpoint call outcome.
     fn classify(&self, outcome: CallOutcome<'_>) -> HealthOutcome;
 }
@@ -83,7 +86,7 @@ pub trait OutcomeClassifier: Send + Sync + 'static {
 /// `0` and tonic maps it to `Unknown`, a failure. An absent `grpc-status`
 /// (anything that isn't trailers-only) is treated as a success.
 #[derive(Debug, Default, Clone)]
-pub struct GrpcOutcomeClassifier;
+pub(crate) struct GrpcOutcomeClassifier;
 
 impl OutcomeClassifier for GrpcOutcomeClassifier {
     fn classify(&self, outcome: CallOutcome<'_>) -> HealthOutcome {
