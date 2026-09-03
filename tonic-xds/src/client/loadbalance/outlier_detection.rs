@@ -340,10 +340,29 @@ impl OutlierStatsRegistry {
             if !roll(enforcing) {
                 continue;
             }
-            if state.try_eject(now) {
-                self.ejected_count.fetch_add(1, Ordering::Relaxed);
-                self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
-            }
+            self.try_eject_with_guard(state, now);
+        }
+    }
+
+    /// Eject `state` only while it is still the registered channel for its
+    /// address. Holding the map entry across `try_eject` closes a race: the
+    /// sweep snapshots a not-yet-ejected host, a concurrent EDS update calls
+    /// `remove_channel` (which decrements nothing, since the host wasn't
+    /// ejected), and the sweep then ejects the stale snapshot. Without the
+    /// guard that bumps `ejected_count` for a host that is already gone, and
+    /// nothing ever balances it — the count stays inflated and throttles future
+    /// ejections. A `ptr_eq` check also rejects an address that was removed and
+    /// re-added as a fresh state.
+    fn try_eject_with_guard(&self, state: &Arc<OutlierChannelState>, now: Instant) {
+        let Some(entry) = self.channels.get(state.addr()) else {
+            return;
+        };
+        if !Arc::ptr_eq(entry.value(), state) {
+            return;
+        }
+        if state.try_eject(now) {
+            self.ejected_count.fetch_add(1, Ordering::Relaxed);
+            self.ejected_set_version.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -724,6 +743,33 @@ mod tests {
 
         registry.remove_channel(&addr(8084));
         assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// If a host is removed after the sweep snapshots it but before it is
+    /// ejected, the guard must not eject the stale snapshot and leak
+    /// `ejected_count` (nothing would ever balance it).
+    #[test]
+    fn eject_guard_skips_removed_channel() {
+        let registry = make_registry_only(fp_config(50, 10, 3));
+        let a = registry.add_channel(addr(8080));
+        registry.remove_channel(&addr(8080));
+
+        registry.try_eject_with_guard(&a, Instant::now());
+
+        assert!(!a.is_ejected());
+        assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// The guard still ejects a host that is present and unchanged.
+    #[test]
+    fn eject_guard_ejects_present_channel() {
+        let registry = make_registry_only(fp_config(50, 10, 3));
+        let a = registry.add_channel(addr(8080));
+
+        registry.try_eject_with_guard(&a, Instant::now());
+
+        assert!(a.is_ejected());
+        assert_eq!(registry.ejected_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
