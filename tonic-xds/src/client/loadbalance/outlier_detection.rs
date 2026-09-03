@@ -215,7 +215,10 @@ impl OutlierStatsRegistry {
             .iter()
             .map(|e| {
                 let state = e.value().clone();
-                let (s, f) = state.counters();
+                // A50 step 2 swaps (resets) the counter buckets *before* the
+                // algorithms run, so an outcome that lands mid-sweep accrues to
+                // the fresh bucket instead of being dropped by a later reset.
+                let (s, f) = state.snapshot_and_reset();
                 (state, s, f)
             })
             .collect();
@@ -272,8 +275,10 @@ impl OutlierStatsRegistry {
             }
         }
 
+        // Counters were already reset when the snapshot was taken (A50 step 2),
+        // so this pass only decrements the ejection-time multiplier for hosts
+        // that are still healthy (A50 step 5).
         for (state, _, _) in &snapshots {
-            state.snapshot_and_reset();
             if !state.is_ejected() {
                 state.decrement_multiplier();
             }
