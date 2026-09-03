@@ -77,10 +77,11 @@ pub trait OutcomeClassifier: Send + Sync + 'static {
 }
 
 /// gRPC outcome classifier. A transport error or a non-2xx HTTP status is a
-/// failure; on a 2xx response the `grpc-status` header decides — absent or `0`
-/// is a success, and any other value (including an unparseable one) is a failure
-/// (tonic emits trailers-only errors as HTTP 200 with `grpc-status` in the
-/// leading headers).
+/// failure; on a 2xx response the `grpc-status` in the leading headers decides.
+/// Decoding is deferred to [`tonic::Status::from_header_map`] so the verdict
+/// matches how the RPC actually resolves — e.g. `grpc-status: 00` is not a valid
+/// `0` and tonic maps it to `Unknown`, a failure. An absent `grpc-status`
+/// (anything that isn't trailers-only) is treated as a success.
 #[derive(Debug, Default, Clone)]
 pub struct GrpcOutcomeClassifier;
 
@@ -92,13 +93,10 @@ impl OutcomeClassifier for GrpcOutcomeClassifier {
                 if !status.is_success() {
                     return HealthOutcome::Failure;
                 }
-                let ok = headers
-                    .get("grpc-status")
-                    .is_none_or(|v| v.to_str().ok().and_then(|s| s.parse::<u32>().ok()) == Some(0));
-                if ok {
-                    HealthOutcome::Success
-                } else {
-                    HealthOutcome::Failure
+                match tonic::Status::from_header_map(headers) {
+                    None => HealthOutcome::Success,
+                    Some(s) if s.code() == tonic::Code::Ok => HealthOutcome::Success,
+                    Some(_) => HealthOutcome::Failure,
                 }
             }
         }
@@ -165,6 +163,13 @@ mod tests {
     #[test]
     fn grpc_unparseable_status_is_failure() {
         assert_eq!(classify(200, Some("not-a-number")), HealthOutcome::Failure);
+    }
+
+    #[test]
+    fn grpc_leading_zero_status_is_failure() {
+        // "00" is not a valid grpc-status `0`; tonic decodes it to Unknown, so
+        // the RPC fails and OD must not count it as a success.
+        assert_eq!(classify(200, Some("00")), HealthOutcome::Failure);
     }
 
     #[test]
