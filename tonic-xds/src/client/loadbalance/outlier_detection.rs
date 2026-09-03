@@ -840,21 +840,21 @@ mod tests {
         }
     }
 
-    /// minimum_hosts gate: only 2 hosts meet request_volume but
-    /// minimum_hosts is 5 ⇒ algorithm skipped, no ejection.
+    /// minimum_hosts boundary: with exactly `minimum_hosts` qualifying hosts the
+    /// gate opens (`>=`) and the lone outlier is ejected. A `>` would skip the
+    /// algorithm and leave it un-ejected, so this pins the comparison — a case
+    /// far below the minimum can't, since `>=` and `>` behave identically there.
     #[test]
-    fn success_rate_minimum_hosts_gates_ejection() {
-        let registry = make_registry_only(sr_config(1900, 10, 5));
-        let mut all = vec![];
+    fn success_rate_minimum_hosts_boundary_ejects_outlier() {
+        let registry = make_registry_only(sr_config(1000, 10, 3));
+        let bad = registry.add_channel(addr(8082));
         for port in 8080..=8081 {
             let s = registry.add_channel(addr(port));
-            drive(&s, 0, 100);
-            all.push(s);
+            drive(&s, 100, 0);
         }
+        drive(&bad, 0, 100);
         registry.run_housekeeping();
-        for s in &all {
-            assert!(!s.is_ejected());
-        }
+        assert!(bad.is_ejected());
     }
 
     /// request_volume filter: the low-traffic outlier is excluded from
