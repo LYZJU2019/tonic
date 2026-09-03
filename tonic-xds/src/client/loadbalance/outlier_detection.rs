@@ -244,11 +244,10 @@ impl OutlierStatsRegistry {
                 let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
                 let stdev = variance.sqrt();
                 let threshold = mean - stdev * f64::from(sr.stdev_factor) / 1000.0;
-                let max_ejections = self.max_ejections(&config);
                 self.eject_outliers(
                     &snapshots,
                     request_volume,
-                    max_ejections,
+                    config.max_ejection_percent.get(),
                     sr.enforcing_success_rate.get(),
                     |s, _f, total| 100.0 * (s as f64) / (total as f64) < threshold,
                 );
@@ -262,12 +261,11 @@ impl OutlierStatsRegistry {
                 .filter(|(_, s, f)| s + f >= request_volume)
                 .count() as u64;
             if qualifying >= u64::from(fp.minimum_hosts) {
-                let max_ejections = self.max_ejections(&config);
                 let threshold = u64::from(fp.threshold.get());
                 self.eject_outliers(
                     &snapshots,
                     request_volume,
-                    max_ejections,
+                    config.max_ejection_percent.get(),
                     fp.enforcing_failure_percentage.get(),
                     // failure_pct = 100 * failure / total. A50 uses strict ">".
                     |_s, f, total| 100 * f / total > threshold,
@@ -321,10 +319,11 @@ impl OutlierStatsRegistry {
         &self,
         snapshots: &[(Arc<OutlierChannelState>, u64, u64)],
         request_volume: u64,
-        max_ejections: u64,
+        max_ejection_percent: u8,
         enforcing: u8,
         is_outlier: impl Fn(u64, u64, u64) -> bool,
     ) {
+        let endpoint_count = snapshots.len() as u64;
         let now = Instant::now();
         for (state, s, f) in snapshots {
             let (s, f) = (*s, *f);
@@ -332,7 +331,7 @@ impl OutlierStatsRegistry {
             if total == 0 || total < request_volume || state.is_ejected() {
                 continue;
             }
-            if self.ejected_count.load(Ordering::Relaxed) >= max_ejections {
+            if !self.can_eject_more(endpoint_count, max_ejection_percent) {
                 break;
             }
             if !is_outlier(s, f, total) {
@@ -348,15 +347,26 @@ impl OutlierStatsRegistry {
         }
     }
 
-    /// Resolve `max_ejection_percent` against the current channel
-    /// count. A50 mandates "at least one address regardless of the
-    /// value" — without this floor the default 10% × small clusters
-    /// (e.g. 5 endpoints) rounds to zero and silently disables
-    /// ejection. An empty pool genuinely has nothing to eject.
-    fn max_ejections(&self, config: &OutlierDetectionConfig) -> u64 {
-        let len = self.channels.len() as u64;
-        let cap = len * u64::from(config.max_ejection_percent.get()) / 100;
-        if len > 0 { cap.max(1) } else { 0 }
+    /// gRFC A50 checks the ejection cap *before* each ejection: "If the
+    /// percentage of ejected addresses is greater than or equal to
+    /// `max_ejection_percent`, stop." Evaluating it per-ejection rather than
+    /// precomputing `count * pct / 100` matches the spec — a 4-endpoint cluster
+    /// at 30% ejects 2 (0% and 25% are both below 30%), whereas the truncated
+    /// precomputed cap `floor(1.2) = 1` under-ejects. The first ejection is
+    /// always allowed (A50 "at least one address regardless of the value"); an
+    /// empty pool has nothing to eject.
+    ///
+    /// Integer division is exact: `floor(100 * ejected / count) < pct` iff
+    /// `100 * ejected / count < pct`, because `pct` is a whole number.
+    fn can_eject_more(&self, endpoint_count: u64, max_ejection_percent: u8) -> bool {
+        if endpoint_count == 0 {
+            return false;
+        }
+        let ejected = self.ejected_count.load(Ordering::Relaxed);
+        if ejected == 0 {
+            return true;
+        }
+        100 * ejected / endpoint_count < u64::from(max_ejection_percent)
     }
 }
 
@@ -655,7 +665,7 @@ mod tests {
 
     /// A50 §"max_ejection_percent": at least one address may be
     /// ejected regardless of the percentage. 5 hosts × 10% = 0
-    /// arithmetically; the floor still allows 1.
+    /// arithmetically; the first ejection is always allowed.
     #[test]
     fn max_ejection_percent_permits_at_least_one_ejection() {
         let mut config = fp_config(50, 10, 3);
@@ -674,6 +684,27 @@ mod tests {
 
         let ejected = all.iter().filter(|s| s.is_ejected()).count();
         assert_eq!(ejected, 1);
+    }
+
+    /// A50 re-checks the ejected percentage before each ejection, so a
+    /// 4-endpoint cluster at 30% ejects 2 (0% and 25% are below 30%; 50%
+    /// stops). The old precomputed cap `floor(4 * 30 / 100) = 1` under-ejected.
+    #[test]
+    fn max_ejection_percent_ejects_up_to_a50_boundary() {
+        let mut config = fp_config(50, 10, 3);
+        config.max_ejection_percent = pct(30);
+        let registry = make_registry_only(config);
+
+        let mut all = vec![];
+        for port in 8080..=8083 {
+            let s = registry.add_channel(addr(port));
+            drive(&s, 0, 100);
+            all.push(s);
+        }
+        registry.run_housekeeping();
+
+        let ejected = all.iter().filter(|s| s.is_ejected()).count();
+        assert_eq!(ejected, 2);
     }
 
     #[test]
