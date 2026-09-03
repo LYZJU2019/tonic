@@ -1215,14 +1215,15 @@ mod tests {
         for _ in 0..100 {
             let _ = lb.call("hello").await;
         }
-        registry.run_housekeeping();
-        let _ = poll_ready_now(&mut lb);
 
-        assert_eq!(
-            lb.ejected.len(),
-            0,
-            "Ignore must record nothing, so no ejection can occur",
-        );
+        // Ignore records neither success nor failure, so the counters stay at
+        // zero. A "not ejected" check can't prove this: a classifier that
+        // recorded a success on each failing call would also never eject.
+        // `add_channel` is get-or-create, so this reads the state the load
+        // balancer has been recording into.
+        for port in 8080..=8084 {
+            assert_eq!(registry.add_channel(addr(port)).counters(), (0, 0));
+        }
     }
 
     #[tokio::test]
