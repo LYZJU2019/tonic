@@ -37,10 +37,10 @@
 //!   `max_ejection_time`); the LB then routes the resolved
 //!   [`UnejectedChannel`] back into the ready set.
 //! - **Housekeeping actor** ([`spawn_actor`]): on each
-//!   `config.interval` tick, runs the success-rate and
-//!   failure-percentage algorithms over a snapshot of counters, ejects
-//!   qualifying channels, resets counters, and decrements multipliers
-//!   for non-ejected channels. When the ejected-set membership changes,
+//!   `config.interval` tick, snapshots and resets every channel's
+//!   counters, runs the success-rate and failure-percentage algorithms
+//!   over that snapshot, ejects qualifying channels, and decrements
+//!   multipliers for non-ejected channels. When the ejected-set membership changes,
 //!   broadcasts a fresh snapshot on the `watch` channel; quiet ticks
 //!   skip the broadcast via an O(1) version compare.
 //!
@@ -180,7 +180,9 @@ impl OutlierStatsRegistry {
 
     /// One interval-boundary sweep (gRFC A50 §6). Order matters:
     ///
-    /// 1. Snapshot every channel's counters for one consistent pass.
+    /// 1. Snapshot and reset every channel's counters for one
+    ///    consistent pass (A50 §2 swaps the counter buckets before the
+    ///    algorithms run).
     /// 2. Run the success-rate algorithm against the snapshot: compute
     ///    mean and stdev of success rates across qualifying hosts (per
     ///    `request_volume`), gated by `minimum_hosts`; eject any host
@@ -192,8 +194,8 @@ impl OutlierStatsRegistry {
     ///    then `max_ejection_percent`, then per-channel threshold and
     ///    the enforcement roll. Hosts already ejected by step 2 are
     ///    skipped, and the `max_ejection_percent` cap accounts for them.
-    /// 4. Reset counters and decrement multipliers for non-ejected
-    ///    channels.
+    /// 4. Decrement multipliers for non-ejected channels (counters were
+    ///    already reset in step 1).
     /// 5. If the ejected-set version changed (sweep ejected at least
     ///    one channel, or the LB unejected between ticks), rebuild
     ///    the snapshot of ejected addresses and broadcast it on the
