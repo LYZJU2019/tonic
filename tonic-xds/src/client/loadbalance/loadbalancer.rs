@@ -374,7 +374,7 @@ where
         // No ready endpoints. Fail fast iff discovery is closed and
         // nothing else can produce one.
         match discover_result {
-            Poll::Ready(LbError::DiscoverClosed) if self.connecting.len() == 0 => {
+            Poll::Ready(LbError::DiscoverClosed) if self.connecting.is_empty() => {
                 Poll::Ready(Err(LbError::Stagnation))
             }
             Poll::Ready(e) => {
@@ -435,13 +435,19 @@ mod tests {
     use crate::client::loadbalance::outcome::GrpcOutcomeClassifier;
     use std::sync::LazyLock;
 
-    /// The `&'static str` mock responses carry no HTTP metadata, so they satisfy
-    /// the load balancer's `OutcomeSource` bound as a 200 with no headers — a
-    /// success under `GrpcOutcomeClassifier`, matching the pre-classifier
-    /// `record_outcome(result.is_ok())` behavior.
+    /// Mock endpoint response. `MockResponse` carries no HTTP metadata, so it
+    /// satisfies the load balancer's `OutcomeSource` bound as a 200 with no
+    /// headers — a success under `GrpcOutcomeClassifier`, matching the
+    /// pre-classifier `record_outcome(result.is_ok())` behavior.
+    ///
+    /// This is a dedicated newtype rather than an `impl` on a primitive so the
+    /// mock can never collide with a future `OutcomeSource` implementation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct MockResponse(&'static str);
+
     static EMPTY_HEADERS: LazyLock<http::HeaderMap> = LazyLock::new(http::HeaderMap::new);
 
-    impl OutcomeSource for &'static str {
+    impl OutcomeSource for MockResponse {
         fn call_outcome(&self) -> CallOutcome<'_> {
             CallOutcome::Response {
                 status: http::StatusCode::OK,
@@ -488,9 +494,9 @@ mod tests {
     }
 
     impl Service<&'static str> for MockService {
-        type Response = &'static str;
+        type Response = MockResponse;
         type Error = tower::BoxError;
-        type Future = future::Ready<Result<&'static str, tower::BoxError>>;
+        type Future = future::Ready<Result<MockResponse, tower::BoxError>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             if self.fail_poll_ready.load(Ordering::Relaxed) {
@@ -505,7 +511,7 @@ mod tests {
             if self.fail_call.load(Ordering::Relaxed) {
                 future::ready(Err("injected call error".into()))
             } else {
-                future::ready(Ok("ok"))
+                future::ready(Ok(MockResponse("ok")))
             }
         }
     }
@@ -944,7 +950,7 @@ mod tests {
         drive_to_ready(&mut lb, &connector).await;
 
         let result = lb.call("hello").await;
-        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(result.unwrap(), MockResponse("ok"));
     }
 
     #[tokio::test]
@@ -963,7 +969,7 @@ mod tests {
 
         let num_requests = 1000;
         for _ in 0..num_requests {
-            assert_eq!(lb.call("hello").await.unwrap(), "ok");
+            assert_eq!(lb.call("hello").await.unwrap(), MockResponse("ok"));
         }
 
         // Check all endpoints were called.
@@ -1180,7 +1186,7 @@ mod tests {
         let _ = poll_ready_now(&mut lb);
 
         assert!(
-            lb.ejected.len() >= 1,
+            !lb.ejected.is_empty(),
             "a success classified as Failure should drive ejection",
         );
     }
