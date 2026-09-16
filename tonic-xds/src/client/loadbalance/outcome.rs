@@ -36,6 +36,8 @@
 //! classifier yet. The public builder hook (and the final `#[non_exhaustive]`
 //! shaping of these types) lands with the outlier-detection `Discover` wiring.
 
+use std::fmt::Debug;
+
 /// Borrowed view of one endpoint call's result, handed to
 /// [`OutcomeClassifier::classify`]. It carries no error payload — outlier
 /// detection only needs to know that a call errored, not why — so it works with
@@ -74,7 +76,7 @@ pub(crate) enum HealthOutcome {
 /// [`GrpcOutcomeClassifier`] interprets gRPC status, while a non-gRPC transport
 /// (e.g. plain HTTP) supplies its own to interpret HTTP status codes (`5xx` =
 /// failure, `4xx` = ignore, ...) without touching the outlier-detection engine.
-pub(crate) trait OutcomeClassifier: Send + Sync + 'static {
+pub(crate) trait OutcomeClassifier: Debug + Send + Sync + 'static {
     /// Classify a single endpoint call outcome.
     fn classify(&self, outcome: CallOutcome<'_>) -> HealthOutcome;
 }
